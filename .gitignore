@@ -52,3 +52,38 @@ CodeCoverage/
 *.VisualState.xml
 TestResult.xml
 nunit-*.xml
+
+# ========== SECURITY: NEVER COMMIT SENSITIVE CONFIG ==========
+# Environment variables and secrets
+.env
+.env.local
+.env.*.local
+Backend/.env
+Frontend/.env
+
+# Configuration files with sensitive data
+appsettings.json
+appsettings.*.json
+!appsettings.example.json
+
+# User secrets
+Backend/Properties/launchSettings.json
+
+# Node modules and lock files (Frontend)
+node_modules/
+Frontend/node_modules/
+Frontend/dist/
+
+# Visual Studio user settings
+.vs/
+.vscode/settings.json
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
