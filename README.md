@@ -1,44 +1,44 @@
 # 🍽️ Restaurant Management System
 
-Một hệ thống quản lý nhà hàng hoàn chỉnh với đặt bàn QR, thanh toán, danh sách bếp và cập nhật realtime.
+A complete restaurant management system with QR table ordering, payments, kitchen display system, and real-time operations.
 
-## 📋 Tính năng chính
+## 📋 Features
 
-- 🎯 **Đặt bàn QR** - Khách hàng quét mã QR để đặt bàn và gọi món
-- 💳 **Thanh toán** - Hỗ trợ PayPal, VietQR, SEPAY
-- 👨‍🍳 **Danh sách bếp (KDS)** - Hiển thị đơn hàng real-time cho bếp
-- 📊 **Báo cáo** - Thống kê doanh thu, chi phí, lợi nhuận
-- 🤖 **AI Chatbot** - Hỗ trợ khách hàng bằng Gemini AI
-- 👥 **Quản lý nhân viên** - Phân quyền Admin, Nhân viên, Bếp
-- 📧 **Thông báo** - Email xác nhận đơn hàng, thanh toán
-- 📱 **Responsive Design** - Chạy trên web, tablet, máy tính
+- 🎯 **QR Table Ordering** - Customers scan QR codes to order from tables
+- 💳 **Payments** - Support PayPal, VietQR, SEPAY
+- 👨‍🍳 **Kitchen Display System (KDS)** - Real-time order display for kitchen
+- 📊 **Reports** - Revenue, expenses, and profit statistics
+- 🤖 **AI Chatbot** - Customer support powered by Gemini AI
+- 👥 **Staff Management** - Role-based permissions (Admin, Staff, Chef)
+- 📧 **Notifications** - Order and payment email confirmations
+- 📱 **Responsive Design** - Works on web, tablets, and desktop
 
-## 🏗️ Cấu trúc project
+## 🏗️ Project Structure
 
 ```
 restaurant-system/
 ├── Backend/              # ASP.NET Core 8.0 API
-│   ├── Controllers/      # Các endpoint API
+│   ├── Controllers/      # API endpoints
 │   ├── Models/          # Database entities & DTOs
 │   ├── Services/        # Business logic
-│   ├── Migrations/      # Database changes
-│   ├── appsettings.json # Cấu hình (template)
-│   └── README.md        # Hướng dẫn Backend
+│   ├── Migrations/      # Database schema changes
+│   ├── appsettings.json # Config file (template)
+│   └── README.md        # Backend documentation
 │
 ├── Frontend/            # React + TypeScript
 │   ├── src/
-│   │   ├── pages/       # Các trang (Admin, Customer, POS)
+│   │   ├── pages/       # Pages (Admin, Customer, POS)
 │   │   ├── components/  # React components
 │   │   └── services/    # API calls
-│   ├── .env             # Biến môi trường (template)
-│   └── README.md        # Hướng dẫn Frontend
+│   ├── .env             # Environment variables (template)
+│   └── README.md        # Frontend documentation
 │
-└── SETUP.md            # Hướng dẫn cài đặt toàn bộ
+└── SETUP.md            # Complete setup guide
 ```
 
-## 🚀 Bắt đầu nhanh
+## 🚀 Quick Start
 
-### 1. Clone project
+### 1. Clone repository
 ```bash
 git clone https://github.com/Orca-BH789/restaurant-system.git
 cd restaurant-system
@@ -49,12 +49,12 @@ cd restaurant-system
 cd Backend
 dotnet restore
 # Copy appsettings.example.json -> appsettings.json
-# Thêm credentials vào appsettings.json
+# Add credentials to appsettings.json
 dotnet ef database update
 dotnet run
 ```
 
-Backend chạy ở: `http://localhost:5000`
+Backend runs at: `http://localhost:5000`
 
 ### 3. Setup Frontend
 ```bash
@@ -64,13 +64,13 @@ npm install
 npm run dev
 ```
 
-Frontend chạy ở: `http://localhost:5173`
+Frontend runs at: `http://localhost:5173`
 
-## 🔑 Thông tin quan trọng
+## 🔑 Important Links
 
-- 📖 **Backend docs**: Xem `Backend/README.md` để hiểu API chi tiết
-- 📖 **Frontend docs**: Xem `Frontend/README.md` để hiểu pages & components
-- ⚙️ **Setup guide**: Xem `SETUP.md` để cài đặt đầy đủ & secure
+- 📖 **Backend docs**: See `Backend/README.md` for detailed API documentation
+- 📖 **Frontend docs**: See `Frontend/README.md` for pages & components
+- ⚙️ **Setup guide**: See `SETUP.md` for complete setup & security
 
 ## 🛠️ Tech Stack
 
@@ -78,17 +78,17 @@ Frontend chạy ở: `http://localhost:5173`
 - ASP.NET Core 8.0
 - Entity Framework Core
 - SQL Server
-- SignalR (real-time)
+- SignalR (real-time updates)
 - Swagger/OpenAPI
 
 **Frontend**:
-- React 18+ TypeScript
+- React 18+ with TypeScript
 - Vite
 - Ant Design + Tailwind CSS
 - Axios
 - React Router
 
-## 📱 Tài khoản demo
+## 📱 Demo Accounts
 
 | Role | Email | Password |
 |------|-------|----------|
@@ -96,19 +96,19 @@ Frontend chạy ở: `http://localhost:5173`
 | Staff | staff@restaurant.com | Staff123! |
 | Chef | chef@restaurant.com | Chef123! |
 
-*(Tài khoản demo này chỉ ở dev, production sử dụng credentials thực)*
+*(Demo accounts for development only, use real credentials in production)*
 
-## 🔒 Bảo mật
+## 🔒 Security
 
-- ✅ Tất cả credentials đã gỡ bỏ khỏi git
-- ✅ Dùng `.env` & `appsettings.example.json` làm template
-- ✅ Xem `SETUP.md` để biết cách setup keys an toàn
+- ✅ All credentials removed from git history
+- ✅ Using `.env` & `appsettings.example.json` as templates
+- ✅ See `SETUP.md` for secure key setup
 
-## 📞 Cần giúp?
+## 📞 Need Help?
 
-- Xem `SETUP.md` để cài đặt chi tiết
-- Xem `Backend/README.md` để hiểu API
-- Xem `Frontend/README.md` để hiểu UI
+- Check `SETUP.md` for detailed setup instructions
+- Check `Backend/README.md` for API details
+- Check `Frontend/README.md` for UI details
 
 ## 👨‍💻 Branches
 
