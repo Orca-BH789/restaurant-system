@@ -1,0 +1,147 @@
+﻿using Microsoft.EntityFrameworkCore.Migrations;
+
+#nullable disable
+
+namespace Restaurant_Management.Migrations
+{
+    /// <inheritdoc />
+    public partial class LinkOrdersReservationsToCustomer : Migration
+    {
+        /// <inheritdoc />
+        protected override void Up(MigrationBuilder migrationBuilder)
+        {
+            // Step 1: Drop FK if it exists (from Orders to Customer)
+            migrationBuilder.DropForeignKey(
+                name: "FK_Orders_Customer_CustomerId",
+                table: "Orders");
+
+            // Step 2: Drop the old index on Reservations CustomerPhone if it exists
+            migrationBuilder.Sql(@"
+                IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Reservations_CustomerPhone')
+                    DROP INDEX [IX_Reservations_CustomerPhone] ON [Reservations];
+            ");
+
+            // Step 3: Drop columns from Reservations
+            migrationBuilder.DropColumn(
+                name: "CustomerEmail",
+                table: "Reservations");
+
+            migrationBuilder.DropColumn(
+                name: "CustomerName",
+                table: "Reservations");
+
+            migrationBuilder.DropColumn(
+                name: "CustomerPhone",
+                table: "Reservations");
+
+            // Step 4: Drop columns from Orders
+            migrationBuilder.DropColumn(
+                name: "CustomerName",
+                table: "Orders");
+
+            migrationBuilder.DropColumn(
+                name: "CustomerPhone",
+                table: "Orders");
+
+            // Step 5: Add CustomerId to Reservations
+            migrationBuilder.AddColumn<int>(
+                name: "CustomerId",
+                table: "Reservations",
+                type: "int",
+                nullable: true);
+
+            // Step 6: Create index on Reservations.CustomerId
+            migrationBuilder.CreateIndex(
+                name: "IX_Reservations_CustomerId",
+                table: "Reservations",
+                column: "CustomerId");
+
+            // Step 7: Add FK from Orders to Customer
+            migrationBuilder.AddForeignKey(
+                name: "FK_Orders_Customer_CustomerId",
+                table: "Orders",
+                column: "CustomerId",
+                principalTable: "Customer",
+                principalColumn: "Id",
+                onDelete: ReferentialAction.SetNull);
+
+            // Step 8: Add FK from Reservations to Customer
+            migrationBuilder.AddForeignKey(
+                name: "FK_Reservations_Customer_CustomerId",
+                table: "Reservations",
+                column: "CustomerId",
+                principalTable: "Customer",
+                principalColumn: "Id",
+                onDelete: ReferentialAction.SetNull);
+        }
+
+        /// <inheritdoc />
+        protected override void Down(MigrationBuilder migrationBuilder)
+        {
+            migrationBuilder.DropForeignKey(
+                name: "FK_Orders_Customer_CustomerId",
+                table: "Orders");
+
+            migrationBuilder.DropForeignKey(
+                name: "FK_Reservations_Customer_CustomerId",
+                table: "Reservations");
+
+            migrationBuilder.DropIndex(
+                name: "IX_Reservations_CustomerId",
+                table: "Reservations");
+
+            migrationBuilder.DropColumn(
+                name: "CustomerId",
+                table: "Reservations");
+
+            migrationBuilder.AddColumn<string>(
+                name: "CustomerEmail",
+                table: "Reservations",
+                type: "nvarchar(100)",
+                maxLength: 100,
+                nullable: true);
+
+            migrationBuilder.AddColumn<string>(
+                name: "CustomerName",
+                table: "Reservations",
+                type: "nvarchar(100)",
+                maxLength: 100,
+                nullable: false,
+                defaultValue: "");
+
+            migrationBuilder.AddColumn<string>(
+                name: "CustomerPhone",
+                table: "Reservations",
+                type: "nvarchar(15)",
+                maxLength: 15,
+                nullable: false,
+                defaultValue: "");
+
+            migrationBuilder.AddColumn<string>(
+                name: "CustomerName",
+                table: "Orders",
+                type: "nvarchar(100)",
+                maxLength: 100,
+                nullable: true);
+
+            migrationBuilder.AddColumn<string>(
+                name: "CustomerPhone",
+                table: "Orders",
+                type: "nvarchar(15)",
+                maxLength: 15,
+                nullable: true);
+
+            migrationBuilder.CreateIndex(
+                name: "IX_Reservations_CustomerPhone",
+                table: "Reservations",
+                column: "CustomerPhone");
+
+            migrationBuilder.AddForeignKey(
+                name: "FK_Orders_Customer_CustomerId",
+                table: "Orders",
+                column: "CustomerId",
+                principalTable: "Customer",
+                principalColumn: "Id");
+        }
+    }
+}

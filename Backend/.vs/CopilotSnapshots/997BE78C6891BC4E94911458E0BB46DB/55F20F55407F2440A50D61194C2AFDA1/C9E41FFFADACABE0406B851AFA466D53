@@ -1,0 +1,171 @@
+﻿using Restaurant_Management.Models.Entities;
+
+namespace Restaurant_Management.Services.AI
+{
+    /// <summary>
+    /// Service để che dấu thông tin khách hàng nhạy cảm
+    /// Cho phép AI phân tích dữ liệu kinh doanh mà không tiếp cận thông tin cá nhân
+    /// </summary>
+    public interface ICustomerDataMaskingService
+    {
+        /// <summary>
+        /// Che dấu thông tin khách hàng trong Order
+        /// </summary>
+        Order MaskOrderCustomerInfo(Order order);
+
+        /// <summary>
+        /// Che dấu thông tin khách hàng trong danh sách Orders
+        /// </summary>
+        List<Order> MaskOrdersCustomerInfo(List<Order> orders);
+
+        /// <summary>
+        /// Che dấu thông tin khách hàng trong Invoice
+        /// </summary>
+        Invoice MaskInvoiceCustomerInfo(Invoice invoice);
+
+        /// <summary>
+        /// Che dấu thông tin khách hàng trong danh sách Invoices
+        /// </summary>
+        List<Invoice> MaskInvoicesCustomerInfo(List<Invoice> invoices);
+
+        /// <summary>
+        /// Che dấu một số điện thoại
+        /// Vd: 0987654321 => 098***321
+        /// </summary>
+        string MaskPhoneNumber(string phone);
+
+        /// <summary>
+        /// Che dấu một tên
+        /// Vd: Nguyễn Văn A => Nguyễn V****
+        /// </summary>
+        string MaskCustomerName(string name);
+    }
+
+    public class CustomerDataMaskingService : ICustomerDataMaskingService
+    {
+        /// <summary>
+        /// Che dấu thông tin khách hàng trong một Order
+        /// </summary>
+        public Order MaskOrderCustomerInfo(Order order)
+        {
+            if (order == null) return null;
+
+            var maskedOrder = new Order
+            {
+                Id = order.Id,
+                OrderNumber = order.OrderNumber,
+                StaffId = order.StaffId,
+                Staff = order.Staff,
+                CustomerName = MaskCustomerName(order.CustomerName ?? ""),
+                CustomerPhone = MaskPhoneNumber(order.CustomerPhone ?? ""),
+                NumberOfGuests = order.NumberOfGuests,
+                SubTotal = order.SubTotal,
+                DiscountAmount = order.DiscountAmount,
+                TaxAmount = order.TaxAmount,
+                TotalAmount = order.TotalAmount,
+                Status = order.Status,
+                OrderType = order.OrderType,
+                Notes = order.Notes,
+                OrderTime = order.OrderTime,
+                ServedTime = order.ServedTime,
+                CompletedTime = order.CompletedTime,
+                CreatedAt = order.CreatedAt,
+                UpdatedAt = order.UpdatedAt,
+                AppliedPromotionId = order.AppliedPromotionId,
+                AppliedPromotion = order.AppliedPromotion,
+                OrderDetails = order.OrderDetails,
+                Invoices = order.Invoices?.Select(i => MaskInvoiceCustomerInfo(i)).ToList(),
+                OrderTables = order.OrderTables
+            };
+
+            return maskedOrder;
+        }
+
+        /// <summary>
+        /// Che dấu thông tin khách hàng trong danh sách Orders
+        /// </summary>
+        public List<Order> MaskOrdersCustomerInfo(List<Order> orders)
+        {
+            if (orders == null || orders.Count == 0) return orders;
+            return orders.Select(MaskOrderCustomerInfo).ToList();
+        }
+
+        /// <summary>
+        /// Che dấu thông tin khách hàng trong một Invoice
+        /// </summary>
+        public Invoice MaskInvoiceCustomerInfo(Invoice invoice)
+        {
+            if (invoice == null) return null;
+
+            var maskedInvoice = new Invoice
+            {
+                Id = invoice.Id,
+                OrderId = invoice.OrderId,
+                Order = invoice.Order != null ? MaskOrderCustomerInfo(invoice.Order) : null,
+                InvoiceNumber = invoice.InvoiceNumber,
+                Amount = invoice.Amount,
+                PromotionDiscount = invoice.PromotionDiscount,
+                PromotionCode = invoice.PromotionCode,
+                PromotionId = invoice.PromotionId,
+                PaymentMethod = invoice.PaymentMethod,
+                Status = invoice.Status,
+                CreatedBy = invoice.CreatedBy,
+                CreatedByUser = invoice.CreatedByUser,
+                CreatedAt = invoice.CreatedAt,
+                UpdatedAt = invoice.UpdatedAt,
+                PromotionUsages = invoice.PromotionUsages
+            };
+
+            return maskedInvoice;
+        }
+
+        /// <summary>
+        /// Che dấu thông tin khách hàng trong danh sách Invoices
+        /// </summary>
+        public List<Invoice> MaskInvoicesCustomerInfo(List<Invoice> invoices)
+        {
+            if (invoices == null || invoices.Count == 0) return invoices;
+            return invoices.Select(MaskInvoiceCustomerInfo).ToList();
+        }
+
+        /// <summary>
+        /// Che dấu số điện thoại
+        /// Vd: 0987654321 => 098***321
+        /// </summary>
+        public string MaskPhoneNumber(string phone)
+        {
+            if (string.IsNullOrEmpty(phone))
+                return "xxxx";
+
+            if (phone.Length < 6)
+                return "xxxx";
+
+            // Giữ lại 3 số đầu và 3 số cuối
+            var start = phone.Substring(0, 3);
+            var end = phone.Substring(phone.Length - 3);
+            return $"{start}***{end}";
+        }
+
+        /// <summary>
+        /// Che dấu tên khách hàng
+        /// Vd: Nguyễn Văn A => Nguyễn V****
+        /// </summary>
+        public string MaskCustomerName(string name)
+        {
+            if (string.IsNullOrEmpty(name))
+                return "xxxx";
+
+            var parts = name.Trim().Split(' ');
+            if (parts.Length == 0)
+                return "xxxx";
+
+            // Giữ lại phần họ đầu tiên, che dấu phần còn lại
+            if (parts.Length == 1)
+                return $"{parts[0][0]}****";
+
+            var lastName = parts[parts.Length - 1];
+            var firstLetter = lastName[0].ToString();
+            return $"{parts[0]} {firstLetter}****";
+        }
+    }
+}

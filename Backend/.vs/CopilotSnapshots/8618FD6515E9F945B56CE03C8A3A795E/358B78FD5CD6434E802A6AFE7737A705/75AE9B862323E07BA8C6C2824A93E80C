@@ -1,0 +1,987 @@
+﻿using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using Restaurant_Management.Data;
+using Restaurant_Management.Models.Entities;
+using Restaurant_Management.Services.Payment;
+using System.Security.Claims;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
+
+namespace Restaurant_Management.Controllers
+{
+    [ApiController]
+    [Route("api/[controller]")]
+    [Authorize]
+    public class PaymentController : ControllerBase
+    {
+        private readonly RestaurantDbContext _context;
+        private readonly IPaymentService _paymentService;
+        private readonly ILogger<PaymentController> _logger;
+
+        public PaymentController(RestaurantDbContext context, IPaymentService paymentService, ILogger<PaymentController> logger)
+        {
+            _context = context;
+            _paymentService = paymentService;
+            _logger = logger;
+        }
+
+        #region VietQR Payment APIs
+
+        /// <summary>
+        /// Tạo mã QR VietQR cho thanh toán nội địa
+        /// </summary>
+        [HttpPost("vietqr/generate")]
+        public async Task<IActionResult> GenerateVietQR([FromBody] VietQRGenerateRequest request)
+        {
+            try
+            {
+                if (request.InvoiceId <= 0)
+                    return BadRequest(new { success = false, message = "Invoice ID không hợp lệ" });
+
+                var invoice = await _context.Invoices
+                    .Include(i => i.Order)
+                    .FirstOrDefaultAsync(i => i.Id == request.InvoiceId);
+
+                if (invoice == null)
+                    return NotFound(new { success = false, message = "Không tìm thấy hóa đơn" });
+
+                if (invoice.Status == "Completed")
+                    return BadRequest(new { success = false, message = "Hóa đơn đã được thanh toán" });
+
+                var result = await _paymentService.GenerateVietQRAsync(new VietQRRequest
+                {
+                    InvoiceId = invoice.Id,
+                    OrderId = invoice.OrderId,
+                    Amount = invoice.Amount,
+                    Description = $"Thanh toan hoa don #{invoice.Id}"
+                });
+
+                // Cập nhật invoice
+                invoice.PaymentMethod = "VietQR";
+                invoice.TransactionId = result.ReferenceId;
+                invoice.UpdatedAt = DateTime.UtcNow;
+                await _context.SaveChangesAsync();
+
+                return Ok(new
+                {
+                    success = true,
+                    data = new
+                    {
+                        qrCode = result.QRCodeBase64,
+                        qrDataURL = result.QRDataURL,
+                        referenceId = result.ReferenceId,
+                        amount = result.Amount,
+                        bankAccount = result.BankAccount,
+                        bankName = result.BankName,
+                        accountName = result.AccountName,
+                        content = result.Content,
+                        expiresAt = result.ExpiresAt
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error generating VietQR");
+                return StatusCode(500, new
+                {
+                    success = false,
+                    message = "Không thể tạo mã QR. Vui lòng thử lại."
+                });
+            }
+        }
+
+        /// <summary>
+        /// Kiểm tra trạng thái thanh toán VietQR
+        /// </summary>
+        [HttpGet("vietqr/check/{referenceId}")]
+        public async Task<IActionResult> CheckVietQRStatus(string referenceId)
+        {
+            try
+            {
+                var result = await _paymentService.CheckVietQRStatusAsync(referenceId);
+               
+                if (result.Status == "success")
+                {
+                    var invoice = await _context.Invoices
+                        .FirstOrDefaultAsync(i => i.TransactionId == referenceId);
+
+                    if (invoice != null && invoice.Status != "Completed")
+                    {
+                        invoice.Status = "Completed";
+                        invoice.PaymentTime = result.PaidAt ?? DateTime.UtcNow;
+                        invoice.UpdatedAt = DateTime.UtcNow;
+                        invoice.Notes = $"Thanh toán VietQR thành công - Bank TXN: {result.BankTransactionId}";
+
+                        // Cập nhật order status
+                        var order = await _context.Orders.FindAsync(invoice.OrderId);
+                        if (order != null)
+                        {
+                            order.Status = "Paid";
+                            order.UpdatedAt = DateTime.UtcNow;
+                        }
+
+                        await _context.SaveChangesAsync();
+                    }
+                }
+
+                return Ok(new
+                {
+                    success = true,
+                    data = new
+                    {
+                        status = result.Status,
+                        transactionId = result.TransactionId,
+                        amount = result.Amount,
+                        paidAmount = result.PaidAmount,
+                        paidAt = result.PaidAt,
+                        bankTransactionId = result.BankTransactionId
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error checking VietQR status");
+                return StatusCode(500, new
+                {
+                    success = false,
+                    message = "Không thể kiểm tra trạng thái thanh toán"
+                });
+            }
+        }
+
+        /// <summary>
+        /// Webhook nhận thông báo từ Sepay
+        /// Route: /hooks/sepay-payment (theo config Sepay của bạn)
+        /// </summary>
+        [HttpPost("/hooks/sepay-payment")]
+        [AllowAnonymous]
+        public async Task<IActionResult> SepayWebhook([FromBody] SepayWebhookRequest request)
+        {
+            try
+            {              
+                var jsonRequest = JsonSerializer.Serialize(request);
+                _logger.LogInformation($"Sepay Webhook Received: {jsonRequest}");
+
+                // Validate request
+                if (request == null)
+                {
+                    _logger.LogWarning("Sepay webhook request is null");
+                    return BadRequest(new { success = false, message = "Invalid request" });
+                }
+              
+                if (request.TransferType != "in")
+                {
+                    _logger.LogInformation($"Skip transfer type: {request.TransferType}");
+                    return Ok(new { success = true, message = "Not an incoming transfer" });
+                }
+              
+                // Format: "108717836490 0349937898 TTDH48"
+                var orderId = ExtractOrderIdFromContent(request.Content);
+
+                if (orderId == null)
+                {
+                    _logger.LogWarning($"Cannot extract Order ID from: {request.Content}");
+                    return Ok(new { success = true, message = "Invalid content format" });
+                }
+
+                _logger.LogInformation($"Extracted Order ID: {orderId}");
+                
+                var invoice = await _context.Invoices
+                    .Include(i => i.Order)
+                    .Where(i => i.OrderId == orderId.Value &&
+                               i.Status == "Pending" &&
+                               i.PaymentMethod == "VietQR")
+                    .OrderByDescending(i => i.CreatedAt)
+                    .FirstOrDefaultAsync();
+
+                if (invoice == null)
+                {
+                    _logger.LogWarning($"No pending VietQR invoice for Order {orderId}");
+                    return Ok(new { success = true, message = "Invoice not found or already processed" });
+                }
+
+                _logger.LogInformation($"Found Invoice #{invoice.Id}, Amount: {invoice.Amount:N0}đ");
+
+                // Validate số tiền
+                var expectedAmount = invoice.Amount;
+                var receivedAmount = request.TransferAmount;
+                var difference = Math.Abs(expectedAmount - receivedAmount);
+
+                if (difference > 1000) // Cho phép sai số 1000đ
+                {
+                    _logger.LogWarning($"Amount mismatch - Expected: {expectedAmount:N0}đ, Received: {receivedAmount:N0}đ, Diff: {difference:N0}đ");
+
+                    invoice.Notes = $"CẢNH BÁO SỐ TIỀN:\n" +
+                                   $"Cần thanh toán: {expectedAmount:N0}đ\n" +
+                                   $"Đã nhận: {receivedAmount:N0}đ\n" +
+                                   $"Chênh lệch: {difference:N0}đ\n" +
+                                   $"Sepay ID: {request.Id}\n" +
+                                   $"Ref: {request.ReferenceCode}\n" +
+                                   $"Thời gian: {request.TransactionDate}";
+                }
+                else
+                {
+                    invoice.Notes = $"Thanh toán VietQR thành công\n" +
+                                   $"Ngân hàng: {request.Gateway}\n" +
+                                   $"Số tiền: {receivedAmount:N0}đ\n" +
+                                   $"Nội dung: {request.Content}\n" +
+                                   $"Sepay ID: {request.Id}\n" +
+                                   $"Ref: {request.ReferenceCode}\n" +
+                                   $"Thời gian: {request.TransactionDate}";
+                }
+
+                // Cập nhật Invoice
+                invoice.Status = "Paid";
+                invoice.ReceivedAmount = receivedAmount;  // ✅ Cập nhật từ Sepay
+                invoice.ChangeAmount = receivedAmount - invoice.Amount;  // ✅ Tính toán tiền thừa
+                invoice.PaymentTime = ParseSepayDateTime(request.TransactionDate);
+                invoice.TransactionId = request.ReferenceCode; 
+                invoice.UpdatedAt = DateTime.UtcNow;
+
+                // Cập nhật Order status
+                if (invoice.Order != null)
+                {
+                    invoice.Order.Status = "Paid";
+                    invoice.Order.UpdatedAt = DateTime.UtcNow;
+
+                    _logger.LogInformation($"Updated Order #{invoice.OrderId} → Paid");
+                }
+
+                await _context.SaveChangesAsync();
+
+                _logger.LogInformation($"Payment completed - Invoice #{invoice.Id}, Order #{invoice.OrderId}");
+
+                try
+                {                    
+                    var staffIdClaim = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+                    var staff = await _context.Users.FirstOrDefaultAsync(s => s.Username == staffIdClaim);
+
+                    
+                    using (var httpClient = new HttpClient())
+                    {                      
+                        var baseUrl = "https://webdemocuahangtraicay.io.vn/core"; 
+
+                        var completeOrderRequest = new
+                        {
+                            paymentMethod = "VietQR",
+                            amountPaid = receivedAmount,
+                            userId = staff?.Id ?? 9, 
+                            receivedAmount = receivedAmount,
+                            changeAmount = 0
+                        };
+
+                        var content = new StringContent(
+                            JsonSerializer.Serialize(completeOrderRequest),
+                            System.Text.Encoding.UTF8,
+                            "application/json"
+                        );
+
+                        var response = await httpClient.PostAsync(
+                            $"{baseUrl}/api/Orders/{orderId}/complete",
+                            content
+                        );
+
+                        if (response.IsSuccessStatusCode)
+                        {
+                            _logger.LogInformation($"Order #{orderId} completed successfully - Table freed!");
+                        }
+                        else
+                        {
+                            var errorContent = await response.Content.ReadAsStringAsync();
+                            _logger.LogWarning($"Complete Order API returned {response.StatusCode}: {errorContent}");
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, $"❌ Error calling Complete Order API for Order #{orderId}");                   
+                }
+
+                return Ok(new
+                {
+                    success = true,
+                    message = "Payment processed successfully",
+                    data = new
+                    {
+                        invoiceId = invoice.Id,
+                        orderId = invoice.OrderId,
+                        amount = receivedAmount,
+                        status = "Completed"
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ Error processing Sepay webhook");
+
+                // Vẫn return 200 để Sepay không retry
+                return Ok(new
+                {
+                    success = false,
+                    message = "Error but received",
+                    error = ex.Message
+                });
+            }
+        }
+           
+           
+        
+
+        #endregion
+
+        #region PayPal Payment APIs
+
+       
+        [HttpPost("paypal/create-order")]
+        public async Task<IActionResult> CreatePayPalOrder([FromBody] PayPalOrderRequest request)
+        {
+            try
+            {
+                if (request.InvoiceId <= 0)
+                    return BadRequest(new { success = false, message = "Invoice ID không hợp lệ" });
+
+                var invoice = await _context.Invoices
+                    .Include(i => i.Order)
+                    .FirstOrDefaultAsync(i => i.Id == request.InvoiceId);
+
+                if (invoice == null)
+                    return NotFound(new { success = false, message = "Không tìm thấy hóa đơn" });
+
+                if (invoice.Status == "Completed")
+                    return BadRequest(new { success = false, message = "Hóa đơn đã được thanh toán" });
+
+                // Convert VND to USD (example rate, should get from API)
+                decimal amountUSD = invoice.Amount / 26390; // Tỷ giá mẫu
+
+                var result = await _paymentService.CreatePayPalOrderAsync(new PayPalRequest
+                {
+                    InvoiceId = invoice.Id,
+                    OrderId = invoice.OrderId,
+                    Amount = amountUSD,
+                    Currency = "USD",
+                    Description = $"Payment for Order #{invoice.OrderId}"
+                });
+
+                // Cập nhật invoice
+                invoice.PaymentMethod = "PayPal";
+                invoice.TransactionId = result.OrderId;
+                invoice.UpdatedAt = DateTime.UtcNow;
+                await _context.SaveChangesAsync();
+
+                return Ok(new
+                {
+                    success = true,
+                    data = new
+                    {
+                        orderId = result.OrderId,
+                        approvalUrl = result.ApprovalUrl,
+                        amount = result.Amount,
+                        currency = result.Currency,
+                        expiresAt = result.ExpiresAt
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error creating PayPal order");
+                return StatusCode(500, new
+                {
+                    success = false,
+                    message = "Không thể tạo thanh toán PayPal. Vui lòng thử lại."
+                });
+            }
+        }
+
+        /// <summary>
+        /// Xác nhận thanh toán PayPal sau khi khách hàng approve
+        /// </summary>
+        [HttpPost("paypal/capture/{orderId}")]
+        public async Task<IActionResult> CapturePayPalOrder(string orderId)
+        {
+            try
+            {
+                var result = await _paymentService.CapturePayPalOrderAsync(orderId);
+
+                if (result.Status == "completed")
+                {
+                    var invoice = await _context.Invoices
+                        .Include(i => i.Order)
+                        .FirstOrDefaultAsync(i => i.TransactionId == orderId);
+
+                    if (invoice != null && invoice.Status != "Completed")
+                    {
+                        invoice.Status = "Completed";
+                        invoice.PaymentTime = result.PaidAt;
+                        invoice.ReceivedAmount = invoice.Amount;  // ✅ Đã thanh toán đủ
+                        invoice.ChangeAmount = 0;  // ✅ PayPal không có tiền thừa
+                        invoice.UpdatedAt = DateTime.UtcNow;
+                        invoice.Notes = $"PayPal payment - Payer: {result.PayerEmail} - TXN: {result.TransactionId}";
+
+                        // Cập nhật order
+                        if (invoice.Order != null)
+                        {
+                            invoice.Order.Status = "Paid";
+                            invoice.Order.UpdatedAt = DateTime.UtcNow;
+                        }
+
+                        await _context.SaveChangesAsync();
+                    }
+                }
+
+                return Ok(new
+                {
+                    success = true,
+                    data = new
+                    {
+                        status = result.Status,
+                        transactionId = result.TransactionId,
+                        amount = result.Amount,
+                        currency = result.Currency,
+                        paidAt = result.PaidAt,
+                        payerEmail = result.PayerEmail,
+                        payerName = result.PayerName
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error capturing PayPal order");
+                return StatusCode(500, new
+                {
+                    success = false,
+                    message = "Không thể xác nhận thanh toán PayPal"
+                });
+            }
+        }
+
+        /// <summary>
+        /// Kiểm tra trạng thái PayPal order
+        /// </summary>
+        [HttpGet("paypal/status/{orderId}")]
+        public async Task<IActionResult> GetPayPalOrderStatus(string orderId)
+        {
+            try
+            {
+                var result = await _paymentService.GetPayPalOrderStatusAsync(orderId);
+
+                return Ok(new
+                {
+                    success = true,
+                    data = new
+                    {
+                        status = result.Status,
+                        orderId = result.OrderId,
+                        amount = result.Amount,
+                        currency = result.Currency
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error getting PayPal order status");
+                return StatusCode(500, new
+                {
+                    success = false,
+                    message = "Không thể kiểm tra trạng thái thanh toán"
+                });
+            }
+        }     
+
+        /// <summary>
+        /// Handle PayPal return URL sau khi user approve payment
+        /// Route: /payment/success?token={token}&PayerID={payerId}
+        /// </summary>
+        [HttpGet("/payment/success")]
+        [AllowAnonymous]
+        public async Task<IActionResult> HandlePayPalReturn([FromQuery] string token, [FromQuery] string PayerID)
+        {
+            try
+            {
+                _logger.LogInformation($" PayPal Return - Token: {token}, PayerID: {PayerID}");
+
+                if (string.IsNullOrEmpty(token) || string.IsNullOrEmpty(PayerID))
+                {
+                    return BadRequest(new { success = false, message = "Missing token or PayerID" });
+                }
+
+                // 1. CAPTURE PAYMENT từ PayPal
+                var captureResult = await _paymentService.CapturePayPalOrderAsync(token);
+
+                if (captureResult.Status != "completed")
+                {
+                    _logger.LogWarning($" PayPal capture failed - Status: {captureResult.Status}");
+                    return Redirect("/payment/failed");
+                }
+
+                _logger.LogInformation($" PayPal Captured - TxnID: {captureResult.TransactionId}, Amount: {captureResult.Amount}");
+
+                // 2. TÌM INVOICE dựa trên PayPal Order ID (token)
+                var invoice = await _context.Invoices
+                    .Include(i => i.Order)
+                    .FirstOrDefaultAsync(i => i.TransactionId == token && i.Status == "Pending");
+
+                if (invoice == null)
+                {
+                    _logger.LogWarning($"⚠️ Invoice not found for PayPal token: {token}");                    
+                    return Redirect($"/payment/success-no-invoice?txn={captureResult.TransactionId}");
+                }
+
+                // 3. CẬP NHẬT INVOICE
+                invoice.Status = "Completed";
+                invoice.PaymentMethod = "PayPal";
+                invoice.PaymentTime = captureResult.PaidAt;
+                invoice.ReceivedAmount = invoice.Amount;  // ✅ Đã thanh toán đủ
+                invoice.ChangeAmount = 0;  // ✅ PayPal không có tiền thừa
+                invoice.UpdatedAt = DateTime.UtcNow;
+                invoice.Notes = $"PayPal Payment\n" +
+                               $"Transaction ID: {captureResult.TransactionId}\n" +
+                               $"Payer: {captureResult.PayerEmail}\n" +
+                               $"Amount: {captureResult.Amount} {captureResult.Currency}\n" +
+                               $"Paid At: {captureResult.PaidAt:yyyy-MM-dd HH:mm:ss}";
+
+                // 4. CẬP NHẬT ORDER
+                if (invoice.Order != null)
+                {
+                    invoice.Order.Status = "Paid";
+                    invoice.Order.UpdatedAt = DateTime.UtcNow;
+
+                    _logger.LogInformation($"✅ Updated Order #{invoice.OrderId} → Paid");
+                }
+
+                await _context.SaveChangesAsync();
+
+                _logger.LogInformation($"✅ Payment completed - Invoice #{invoice.Id}, Order #{invoice.OrderId}");
+
+                // 5. REDIRECT VỀ SUCCESS PAGE
+                return Redirect($"/payment/success?invoiceId={invoice.Id}&orderId={invoice.OrderId}");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ Error handling PayPal return");
+                return Redirect("/payment/failed");
+            }
+        }
+
+        /// <summary>
+        /// Success page khi không tìm thấy invoice nhưng PayPal đã charge
+        /// </summary>
+        [HttpGet("/payment/success-no-invoice")]
+        [AllowAnonymous]
+        public IActionResult PaymentSuccessNoInvoice([FromQuery] string txn)
+        {
+            return Ok(new
+            {
+                success = true,
+                message = "Payment completed but invoice not found. Please contact support.",
+                transactionId = txn
+            });
+        }
+
+        /// <summary>
+        /// Handle PayPal cancel URL khi user hủy thanh toán
+        /// Route: /payment/cancel?token={token}
+        /// </summary>
+        [HttpGet("/payment/cancel")]
+        [AllowAnonymous]
+        public async Task<IActionResult> HandlePayPalCancel([FromQuery] string token)
+        {
+            try
+            {
+                _logger.LogInformation($"⚠️ PayPal Cancelled - Token: {token}");
+
+                // Tìm invoice và đánh dấu failed
+                var invoice = await _context.Invoices
+                    .FirstOrDefaultAsync(i => i.TransactionId == token);
+
+                if (invoice != null && invoice.Status == "Pending")
+                {
+                    invoice.Status = "Failed";
+                    invoice.Notes = $"PayPal payment cancelled by user at {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}";
+                    invoice.UpdatedAt = DateTime.UtcNow;
+                    await _context.SaveChangesAsync();
+                }
+
+                return Redirect("/payment/cancelled");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ Error handling PayPal cancel");
+                return Redirect("/payment/cancelled");
+            }
+        }
+
+        #endregion
+
+        #region Cash & Card Payment
+
+        /// <summary>
+        /// Xác nhận thanh toán tiền mặt hoặc thẻ
+        /// </summary>
+        [HttpPost("complete-cash-card")]
+        public async Task<IActionResult> CompleteCashOrCardPayment([FromBody] CashCardPaymentRequest request)
+        {
+            try
+            {
+                var invoice = await _context.Invoices
+                    .Include(i => i.Order)
+                    .FirstOrDefaultAsync(i => i.Id == request.InvoiceId);
+
+                if (invoice == null)
+                    return NotFound(new { success = false, message = "Không tìm thấy hóa đơn" });
+
+                if (invoice.Status == "Completed")
+                    return BadRequest(new { success = false, message = "Hóa đơn đã được thanh toán" });
+
+                // Validate for cash payment
+                if (request.PaymentMethod == "Cash")
+                {
+                    if (request.ReceivedAmount < invoice.Amount)
+                    {
+                        return BadRequest(new
+                        {
+                            success = false,
+                            message = "Số tiền khách đưa phải lớn hơn hoặc bằng tổng tiền"
+                        });
+                    }
+
+                    invoice.ReceivedAmount = request.ReceivedAmount;
+                    invoice.ChangeAmount = request.ReceivedAmount - invoice.Amount;
+                }
+
+                // Update invoice
+                invoice.PaymentMethod = request.PaymentMethod;
+                invoice.Status = "Completed";
+                invoice.PaymentTime = DateTime.UtcNow;
+                invoice.UpdatedAt = DateTime.UtcNow;
+                invoice.Notes = request.Notes;
+
+                // Update order
+                if (invoice.Order != null)
+                {
+                    invoice.Order.Status = "Paid";
+                    invoice.Order.UpdatedAt = DateTime.UtcNow;
+                }
+
+                await _context.SaveChangesAsync();
+
+                return Ok(new
+                {
+                    success = true,
+                    message = "Thanh toán thành công",
+                    data = new
+                    {
+                        invoiceId = invoice.Id,
+                        amount = invoice.Amount,
+                        receivedAmount = invoice.ReceivedAmount,
+                        changeAmount = invoice.ChangeAmount,
+                        paymentMethod = invoice.PaymentMethod,
+                        paymentTime = invoice.PaymentTime
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error completing cash/card payment");
+                return StatusCode(500, new
+                {
+                    success = false,
+                    message = "Không thể hoàn tất thanh toán"
+                });
+            }
+        }
+
+        #endregion
+
+        #region Common APIs
+
+        /// <summary>
+        /// Lấy thông tin invoice
+        /// </summary>
+        [HttpGet("invoice/{invoiceId}")]
+        public async Task<IActionResult> GetInvoice(int invoiceId)
+        {
+            try
+            {
+                var invoice = await _context.Invoices
+                    .Include(i => i.Order)
+                        .ThenInclude(o => o.OrderDetails)
+                            .ThenInclude(od => od.MenuItem)
+                    .FirstOrDefaultAsync(i => i.Id == invoiceId);
+
+                if (invoice == null)
+                    return NotFound(new { success = false, message = "Không tìm thấy hóa đơn" });
+
+                return Ok(new
+                {
+                    success = true,
+                    data = new
+                    {
+                        id = invoice.Id,
+                        orderId = invoice.OrderId,
+                        amount = invoice.Amount,
+                        receivedAmount = invoice.ReceivedAmount,
+                        changeAmount = invoice.ChangeAmount,
+                        paymentMethod = invoice.PaymentMethod,
+                        status = invoice.Status,
+                        transactionId = invoice.TransactionId,
+                        paymentTime = invoice.PaymentTime,
+                        notes = invoice.Notes,
+                        order = invoice.Order == null ? null : new
+                        {
+                            id = invoice.Order.Id,                          
+                            status = invoice.Order.Status,
+                            orderDetails = invoice.Order.OrderDetails.Select(od => new
+                            {
+                                id = od.Id,
+                                menuItemId = od.MenuItemId,
+                                menuItemName = od.MenuItem?.Name,
+                                quantity = od.Quantity,
+                                unit = od.Unit,
+                                unitPrice = od.UnitPrice,
+                                subtotal = od.Subtotal
+                            })
+                        }
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error getting invoice");
+                return StatusCode(500, new
+                {
+                    success = false,
+                    message = "Không thể lấy thông tin hóa đơn"
+                });
+            }
+        }
+
+        /// <summary>
+        /// Hủy thanh toán
+        /// </summary>
+        [HttpPost("cancel")]
+        public async Task<IActionResult> CancelPayment([FromBody] CancelPaymentRequest request)
+        {
+            try
+            {
+                var invoice = await _context.Invoices
+                    .FirstOrDefaultAsync(i => i.Id == request.InvoiceId);
+
+                if (invoice == null)
+                    return NotFound(new { success = false, message = "Không tìm thấy hóa đơn" });
+
+                if (invoice.Status == "Completed")
+                    return BadRequest(new
+                    {
+                        success = false,
+                        message = "Không thể hủy hóa đơn đã thanh toán"
+                    });
+
+                invoice.Status = "Failed";
+                invoice.Notes = $"Đã hủy - Lý do: {request.Reason}";
+                invoice.UpdatedAt = DateTime.UtcNow;
+
+                await _context.SaveChangesAsync();
+
+                return Ok(new
+                {
+                    success = true,
+                    message = "Đã hủy thanh toán thành công"
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error cancelling payment");
+                return StatusCode(500, new
+                {
+                    success = false,
+                    message = "Không thể hủy thanh toán"
+                });
+            }
+        }
+
+        /// <summary>
+        /// Lấy danh sách invoice theo order
+        /// </summary>
+        [HttpGet("by-order/{orderId}")]
+        public async Task<IActionResult> GetInvoicesByOrder(int orderId)
+        {
+            try
+            {
+                var invoices = await _context.Invoices
+                    .Where(i => i.OrderId == orderId)
+                    .OrderByDescending(i => i.CreatedAt)
+                    .Select(i => new
+                    {
+                        id = i.Id,
+                        amount = i.Amount,
+                        paymentMethod = i.PaymentMethod,
+                        status = i.Status,
+                        transactionId = i.TransactionId,
+                        paymentTime = i.PaymentTime,
+                        createdAt = i.CreatedAt
+                    })
+                    .ToListAsync();
+
+                return Ok(new
+                {
+                    success = true,
+                    data = invoices
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error getting invoices by order");
+                return StatusCode(500, new
+                {
+                    success = false,
+                    message = "Không thể lấy danh sách hóa đơn"
+                });
+            }
+        }
+
+        #endregion
+
+        #region Method helper
+       
+        /// Extract Order ID từ content
+        /// Input: "108717836490 0349937898 TTDH48"
+        /// Output: 48      
+        private int? ExtractOrderIdFromContent(string content)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(content))
+                    return null;
+
+                
+                var match = Regex.Match(content, @"TTDH(\d+)", RegexOptions.IgnoreCase);
+
+                if (match.Success && int.TryParse(match.Groups[1].Value, out int orderId))
+                {
+                    return orderId;
+                }
+
+                _logger.LogWarning($"Cannot extract Order ID from content: {content}");
+                return null;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Error extracting Order ID from: {content}");
+                return null;
+            }
+        }
+
+        
+        /// Parse datetime từ Sepay format: "2025-11-26 20:43:31"       
+        private DateTime ParseSepayDateTime(string dateTimeString)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(dateTimeString))
+                    return DateTime.UtcNow;
+
+              
+                if (DateTime.TryParseExact(
+                    dateTimeString,
+                    "yyyy-MM-dd HH:mm:ss",
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.None,
+                    out DateTime result))
+                {
+                    return result;
+                }
+
+              
+                if (DateTime.TryParse(dateTimeString, out result))
+                {
+                    return result;
+                }                
+                _logger.LogWarning($"Cannot parse datetime: {dateTimeString}, using current time");
+                return DateTime.UtcNow;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Error parsing datetime: {dateTimeString}");
+                return DateTime.UtcNow;
+            }
+        }
+
+        #endregion
+    }
+
+    #region Request Models
+
+    public class VietQRGenerateRequest
+    {
+        public int InvoiceId { get; set; }
+    }
+
+    public class PayPalOrderRequest
+    {
+        public int InvoiceId { get; set; }
+    }
+
+    public class CashCardPaymentRequest
+    {
+        public int InvoiceId { get; set; }
+        public string PaymentMethod { get; set; } // "Cash" or "Card"
+        public decimal? ReceivedAmount { get; set; } // For cash only
+        public string? Notes { get; set; }
+    }
+
+    public class CancelPaymentRequest
+    {
+        public int InvoiceId { get; set; }
+        public string Reason { get; set; }
+    }
+
+    public class SepayWebhookRequest
+    {
+        [JsonPropertyName("gateway")]
+        public string Gateway { get; set; }              
+
+        [JsonPropertyName("transactionDate")]
+        public string TransactionDate { get; set; }       
+
+        [JsonPropertyName("accountNumber")]
+        public string AccountNumber { get; set; }        
+
+        [JsonPropertyName("subAccount")]
+        public string SubAccount { get; set; }           
+
+        [JsonPropertyName("code")]
+        public string? Code { get; set; }                 
+
+        [JsonPropertyName("content")]
+        public string Content { get; set; }              
+
+        [JsonPropertyName("transferType")]
+        public string TransferType { get; set; }          
+
+        [JsonPropertyName("description")]
+        public string Description { get; set; }        
+
+        [JsonPropertyName("transferAmount")]
+        public decimal TransferAmount { get; set; }       
+
+        [JsonPropertyName("referenceCode")]
+        public string ReferenceCode { get; set; }        
+
+        [JsonPropertyName("accumulated")]
+        public decimal Accumulated { get; set; }       
+
+        [JsonPropertyName("id")]
+        public int Id { get; set; }                      
+    }
+
+    public class PayPalWebhookRequest
+    {
+        public string EventType { get; set; }
+        public string ResourceId { get; set; }
+        public object Resource { get; set; }
+    }
+
+    #endregion
+}

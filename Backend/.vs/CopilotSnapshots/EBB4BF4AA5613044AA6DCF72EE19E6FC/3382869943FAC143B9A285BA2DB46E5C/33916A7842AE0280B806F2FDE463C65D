@@ -1,0 +1,399 @@
+﻿using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using Restaurant_Management.Controllers;
+using Restaurant_Management.Data;
+using Restaurant_Management.Models.DTO;
+using Restaurant_Management.Models.Entities;
+using Xunit;
+using Moq;
+using Microsoft.Extensions.Logging;
+
+namespace Restaurant_Management.Tests.Controllers
+{
+    public class CustomersControllerTests
+    {
+        private readonly DbContextOptions<RestaurantDbContext> _dbContextOptions;
+        private readonly ILogger<CustomersController> _logger;
+
+        public CustomersControllerTests()
+        {
+            _dbContextOptions = new DbContextOptionsBuilder<RestaurantDbContext>()
+                .UseInMemoryDatabase(databaseName: Guid.NewGuid().ToString())
+                .Options;
+
+            var loggerMock = new Mock<ILogger<CustomersController>>();
+            _logger = loggerMock.Object;
+        }
+
+        private RestaurantDbContext CreateContext()
+        {
+            return new RestaurantDbContext(_dbContextOptions);
+        }
+
+        #region GET Tests
+
+        [Fact]
+        public async Task GetCustomers_WithValidParams_ReturnsOkResult()
+        {
+            // Arrange
+            using var context = CreateContext();
+            context.Customer.Add(new Customer { FullName = "John Doe", Phone = "0123456789", Email = "john@example.com" });
+            await context.SaveChangesAsync();
+
+            var controller = new CustomersController(context, _logger);
+
+            // Act
+            var result = await controller.GetCustomers(
+                searchTerm: null,
+                sortBy: "Id",
+                isDescending: false,
+                pageNumber: 1,
+                pageSize: 10);
+
+            // Assert
+            var okResult = Assert.IsType<OkObjectResult>(result.Result);
+            var returnValue = Assert.IsType<PagedCustomerResponseDTO>(okResult.Value);
+            Assert.Single(returnValue.Data);
+        }
+
+        [Fact]
+        public async Task GetCustomer_WithValidId_ReturnsCustomerDetail()
+        {
+            // Arrange
+            using var context = CreateContext();
+            var customer = new Customer { FullName = "Jane Doe", Phone = "0987654321", Email = "jane@example.com" };
+            context.Customer.Add(customer);
+            await context.SaveChangesAsync();
+
+            var controller = new CustomersController(context, _logger);
+
+            // Act
+            var result = await controller.GetCustomer(customer.Id);
+
+            // Assert
+            var okResult = Assert.IsType<OkObjectResult>(result.Result);
+            var returnValue = Assert.IsType<CustomerDetailDTO>(okResult.Value);
+            Assert.Equal(customer.FullName, returnValue.FullName);
+        }
+
+        [Fact]
+        public async Task GetCustomer_WithInvalidId_ReturnsNotFound()
+        {
+            // Arrange
+            using var context = CreateContext();
+            var controller = new CustomersController(context, _logger);
+
+            // Act
+            var result = await controller.GetCustomer(999);
+
+            // Assert
+            Assert.IsType<NotFoundObjectResult>(result.Result);
+        }
+
+        [Fact]
+        public async Task GetCustomerByPhone_WithValidPhone_ReturnsCustomer()
+        {
+            // Arrange
+            using var context = CreateContext();
+            var customer = new Customer { FullName = "Alice", Phone = "0111111111", Email = "alice@example.com" };
+            context.Customer.Add(customer);
+            await context.SaveChangesAsync();
+
+            var controller = new CustomersController(context, _logger);
+
+            // Act
+            var result = await controller.GetCustomerByPhone("0111111111");
+
+            // Assert
+            var okResult = Assert.IsType<OkObjectResult>(result.Result);
+            var returnValue = Assert.IsType<CustomerDetailDTO>(okResult.Value);
+            Assert.Equal("Alice", returnValue.FullName);
+        }
+
+        [Fact]
+        public async Task GetCustomerByPhone_WithInvalidPhone_ReturnsNotFound()
+        {
+            // Arrange
+            using var context = CreateContext();
+            var controller = new CustomersController(context, _logger);
+
+            // Act
+            var result = await controller.GetCustomerByPhone("0999999999");
+
+            // Assert
+            Assert.IsType<NotFoundObjectResult>(result.Result);
+        }
+
+        #endregion
+
+        #region POST Tests
+
+        [Fact]
+        public async Task PostCustomer_WithValidData_ReturnsCreatedResult()
+        {
+            // Arrange
+            using var context = CreateContext();
+            var controller = new CustomersController(context, _logger);
+            var createDto = new CreateCustomerDTO
+            {
+                FullName = "Bob Smith",
+                Phone = "0222222222",
+                Email = "bob@example.com"
+            };
+
+            // Act
+            var result = await controller.PostCustomer(createDto);
+
+            // Assert
+            var createdResult = Assert.IsType<CreatedAtActionResult>(result.Result);
+            Assert.Equal(nameof(controller.GetCustomer), createdResult.ActionName);
+            var returnValue = Assert.IsType<CustomerDTO>(createdResult.Value);
+            Assert.Equal("Bob Smith", returnValue.FullName);
+        }
+
+        [Fact]
+        public async Task PostCustomer_WithEmptyFullName_ReturnsBadRequest()
+        {
+            // Arrange
+            using var context = CreateContext();
+            var controller = new CustomersController(context, _logger);
+            var createDto = new CreateCustomerDTO { FullName = "" };
+
+            // Act
+            var result = await controller.PostCustomer(createDto);
+
+            // Assert
+            Assert.IsType<BadRequestObjectResult>(result.Result);
+        }
+
+        [Fact]
+        public async Task PostCustomer_WithDuplicatePhone_ReturnsConflict()
+        {
+            // Arrange
+            using var context = CreateContext();
+            context.Customer.Add(new Customer { FullName = "Existing", Phone = "0333333333", Email = "existing@example.com" });
+            await context.SaveChangesAsync();
+
+            var controller = new CustomersController(context, _logger);
+            var createDto = new CreateCustomerDTO
+            {
+                FullName = "New",
+                Phone = "0333333333",
+                Email = "new@example.com"
+            };
+
+            // Act
+            var result = await controller.PostCustomer(createDto);
+
+            // Assert
+            Assert.IsType<ConflictObjectResult>(result.Result);
+        }
+
+        [Fact]
+        public async Task PostCustomer_WithDuplicateEmail_ReturnsConflict()
+        {
+            // Arrange
+            using var context = CreateContext();
+            context.Customer.Add(new Customer { FullName = "Existing", Phone = "0444444444", Email = "same@example.com" });
+            await context.SaveChangesAsync();
+
+            var controller = new CustomersController(context, _logger);
+            var createDto = new CreateCustomerDTO
+            {
+                FullName = "New",
+                Phone = "0555555555",
+                Email = "same@example.com"
+            };
+
+            // Act
+            var result = await controller.PostCustomer(createDto);
+
+            // Assert
+            Assert.IsType<ConflictObjectResult>(result.Result);
+        }
+
+        #endregion
+
+        #region PUT Tests
+
+        [Fact]
+        public async Task PutCustomer_WithValidData_ReturnsNoContent()
+        {
+            // Arrange
+            using var context = CreateContext();
+            var customer = new Customer { FullName = "Original", Phone = "0666666666", Email = "original@example.com" };
+            context.Customer.Add(customer);
+            await context.SaveChangesAsync();
+
+            var controller = new CustomersController(context, _logger);
+            var updateDto = new UpdateCustomerDTO
+            {
+                Id = customer.Id,
+                FullName = "Updated",
+                Phone = "0666666666",
+                Email = "updated@example.com"
+            };
+
+            // Act
+            var result = await controller.PutCustomer(customer.Id, updateDto);
+
+            // Assert
+            Assert.IsType<NoContentResult>(result);
+
+            // Verify update
+            var updatedCustomer = context.Customer.Find(customer.Id);
+            Assert.Equal("Updated", updatedCustomer.FullName);
+        }
+
+        [Fact]
+        public async Task PutCustomer_WithMismatchedId_ReturnsBadRequest()
+        {
+            // Arrange
+            using var context = CreateContext();
+            var controller = new CustomersController(context, _logger);
+            var updateDto = new UpdateCustomerDTO { Id = 1, FullName = "Test" };
+
+            // Act
+            var result = await controller.PutCustomer(2, updateDto);
+
+            // Assert
+            Assert.IsType<BadRequestObjectResult>(result);
+        }
+
+        [Fact]
+        public async Task PutCustomer_WithNonexistentId_ReturnsNotFound()
+        {
+            // Arrange
+            using var context = CreateContext();
+            var controller = new CustomersController(context, _logger);
+            var updateDto = new UpdateCustomerDTO { Id = 999, FullName = "Test" };
+
+            // Act
+            var result = await controller.PutCustomer(999, updateDto);
+
+            // Assert
+            Assert.IsType<NotFoundObjectResult>(result);
+        }
+
+        #endregion
+
+        #region DELETE Tests
+
+        [Fact]
+        public async Task DeleteCustomer_WithValidId_ReturnsNoContent()
+        {
+            // Arrange
+            using var context = CreateContext();
+            var customer = new Customer { FullName = "To Delete", Phone = "0777777777", Email = "delete@example.com" };
+            context.Customer.Add(customer);
+            await context.SaveChangesAsync();
+
+            var controller = new CustomersController(context, _logger);
+
+            // Act
+            var result = await controller.DeleteCustomer(customer.Id);
+
+            // Assert
+            Assert.IsType<NoContentResult>(result);
+
+            // Verify deletion
+            var deletedCustomer = context.Customer.Find(customer.Id);
+            Assert.Null(deletedCustomer);
+        }
+
+        [Fact]
+        public async Task DeleteCustomer_WithNonexistentId_ReturnsNotFound()
+        {
+            // Arrange
+            using var context = CreateContext();
+            var controller = new CustomersController(context, _logger);
+
+            // Act
+            var result = await controller.DeleteCustomer(999);
+
+            // Assert
+            Assert.IsType<NotFoundObjectResult>(result);
+        }
+
+        [Fact]
+        public async Task DeleteCustomer_WithOrders_ReturnsBadRequest()
+        {
+            // Arrange
+            using var context = CreateContext();
+            var customer = new Customer { FullName = "Has Orders", Phone = "0888888888", Email = "hasorders@example.com" };
+            var order = new Order { OrderNumber = "ORD-001", StaffId = 1, CustomerId = customer.Id };
+            customer.Orders.Add(order);
+            context.Customer.Add(customer);
+            await context.SaveChangesAsync();
+
+            var controller = new CustomersController(context, _logger);
+
+            // Act
+            var result = await controller.DeleteCustomer(customer.Id);
+
+            // Assert
+            Assert.IsType<BadRequestObjectResult>(result);
+        }
+
+        #endregion
+
+        #region Search & Filter Tests
+
+        [Fact]
+        public async Task GetCustomers_WithSearchTerm_ReturnsFilteredResults()
+        {
+            // Arrange
+            using var context = CreateContext();
+            context.Customer.Add(new Customer { FullName = "Nguyen Van A", Phone = "0100001111", Email = "a@example.com" });
+            context.Customer.Add(new Customer { FullName = "Tran Van B", Phone = "0100002222", Email = "b@example.com" });
+            await context.SaveChangesAsync();
+
+            var controller = new CustomersController(context, _logger);
+
+            // Act
+            var result = await controller.GetCustomers(
+                searchTerm: "Nguyen",
+                pageNumber: 1,
+                pageSize: 10);
+
+            // Assert
+            var okResult = Assert.IsType<OkObjectResult>(result.Result);
+            var returnValue = Assert.IsType<PagedCustomerResponseDTO>(okResult.Value);
+            Assert.Single(returnValue.Data);
+            Assert.Equal("Nguyen Van A", returnValue.Data[0].FullName);
+        }
+
+        [Fact]
+        public async Task GetCustomers_WithPagination_ReturnsPaginatedResults()
+        {
+            // Arrange
+            using var context = CreateContext();
+            for (int i = 0; i < 25; i++)
+            {
+                context.Customer.Add(new Customer 
+                { 
+                    FullName = $"Customer {i}", 
+                    Phone = $"010000{i:D4}", 
+                    Email = $"customer{i}@example.com" 
+                });
+            }
+            await context.SaveChangesAsync();
+
+            var controller = new CustomersController(context, _logger);
+
+            // Act
+            var result = await controller.GetCustomers(
+                pageNumber: 2,
+                pageSize: 10);
+
+            // Assert
+            var okResult = Assert.IsType<OkObjectResult>(result.Result);
+            var returnValue = Assert.IsType<PagedCustomerResponseDTO>(okResult.Value);
+            Assert.Equal(10, returnValue.Data.Count);
+            Assert.Equal(2, returnValue.PageNumber);
+            Assert.Equal(3, returnValue.TotalPages);
+        }
+
+        #endregion
+    }
+}

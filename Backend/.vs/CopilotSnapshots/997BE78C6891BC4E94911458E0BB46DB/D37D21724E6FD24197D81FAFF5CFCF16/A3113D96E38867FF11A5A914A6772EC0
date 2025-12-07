@@ -1,0 +1,452 @@
+﻿using Microsoft.EntityFrameworkCore;
+using Restaurant_Management.Data;
+using Restaurant_Management.Models.Entities;
+using System.Text.Json;
+
+namespace Restaurant_Management.Services.AI
+{
+    /// <summary>
+    /// Service để AI tự động sinh LINQ queries dựa trên yêu cầu tự nhiên
+    /// VD: "Thống kê tháng 11" → sinh query lấy dữ liệu tháng 11
+    /// </summary>
+    public interface IAIQueryGeneratorService
+    {
+        /// <summary>
+        /// Sinh query động dựa trên yêu cầu của user
+        /// VD: "Doanh thu tháng 11", "Top 10 món bán chạy nhất", "Bàn trống hôm nay"
+        /// </summary>
+        Task<object> GenerateAndExecuteQueryAsync(string userRequest, int? userId = null);
+
+        /// <summary>
+        /// Parse request và tạo filter conditions
+        /// </summary>
+        QueryFilter ParseUserRequest(string userRequest);
+    }
+
+    public class QueryFilter
+    {
+        public string DataType { get; set; } // "revenue", "items", "tables", "reservations", "orders"
+        public DateTime? FromDate { get; set; }
+        public DateTime? ToDate { get; set; }
+        public int? Limit { get; set; } = 10;
+        public string? SortBy { get; set; } // "revenue", "quantity", "usage"
+        public string? SearchKeyword { get; set; }
+        public Dictionary<string, object> AdditionalFilters { get; set; } = new();
+    }
+
+    public class AIQueryGeneratorService : IAIQueryGeneratorService
+    {
+        private readonly RestaurantDbContext _context;
+        private readonly ICustomerDataMaskingService _maskingService;
+
+        public AIQueryGeneratorService(
+            RestaurantDbContext context,
+            ICustomerDataMaskingService maskingService)
+        {
+            _context = context;
+            _maskingService = maskingService;
+        }
+
+        /// <summary>
+        /// AI tự động sinh query và execute
+        /// </summary>
+        public async Task<object> GenerateAndExecuteQueryAsync(string userRequest, int? userId = null)
+        {
+            try
+            {
+                // Parse request thành filter
+                var filter = ParseUserRequest(userRequest);
+
+                // Execute query dựa trên loại dữ liệu
+                object result = filter.DataType switch
+                {
+                    "revenue" => await GetRevenueDataAsync(filter),
+                    "items" => await GetItemsDataAsync(filter),
+                    "tables" => await GetTablesDataAsync(filter),
+                    "reservations" => await GetReservationsDataAsync(filter),
+                    "orders" => await GetOrdersDataAsync(filter),
+                    "promotions" => await GetPromotionsDataAsync(filter),
+                    "staff" => await GetStaffDataAsync(filter),
+                    _ => new { message = "Không xác định được loại dữ liệu yêu cầu" }
+                };
+
+                return result;
+            }
+            catch (Exception ex)
+            {
+                return new { error = $"Lỗi khi thực thi query: {ex.Message}" };
+            }
+        }
+
+        /// <summary>
+        /// Parse yêu cầu tự nhiên thành QueryFilter
+        /// </summary>
+        public QueryFilter ParseUserRequest(string userRequest)
+        {
+            var filter = new QueryFilter();
+            var request = userRequest.ToLower();
+
+            // Detect data type từ keywords
+            if (request.Contains("doanh thu") || request.Contains("revenue") || request.Contains("tiền"))
+                filter.DataType = "revenue";
+            else if (request.Contains("món") || request.Contains("item") || request.Contains("bán chạy"))
+                filter.DataType = "items";
+            else if (request.Contains("bàn") || request.Contains("table") || request.Contains("trống"))
+                filter.DataType = "tables";
+            else if (request.Contains("đặt bàn") || request.Contains("reservation"))
+                filter.DataType = "reservations";
+            else if (request.Contains("đơn") || request.Contains("order"))
+                filter.DataType = "orders";
+            else if (request.Contains("khuyến mãi") || request.Contains("promotion") || request.Contains("giảm giá"))
+                filter.DataType = "promotions";
+            else if (request.Contains("nhân viên") || request.Contains("staff"))
+                filter.DataType = "staff";
+            else
+                filter.DataType = "revenue"; // default
+
+            // Parse date range
+            ParseDateRange(request, filter);
+
+            // Parse limit/top N
+            ParseLimit(request, filter);
+
+            // Parse sort
+            if (request.Contains("cao nhất") || request.Contains("tăng dần") || request.Contains("nhiều nhất"))
+                filter.SortBy = "desc";
+            else if (request.Contains("thấp nhất") || request.Contains("giảm dần") || request.Contains("ít nhất"))
+                filter.SortBy = "asc";
+
+            // Parse search keyword
+            var keywords = ExtractKeywords(request);
+            if (keywords.Count > 0)
+                filter.SearchKeyword = keywords[0];
+
+            return filter;
+        }
+
+        private void ParseDateRange(string request, QueryFilter filter)
+        {
+            var now = DateTime.Now;
+
+            if (request.Contains("hôm nay") || request.Contains("today"))
+            {
+                filter.FromDate = DateTime.Today;
+                filter.ToDate = DateTime.Today.AddDays(1);
+            }
+            else if (request.Contains("hôm qua") || request.Contains("yesterday"))
+            {
+                filter.FromDate = DateTime.Today.AddDays(-1);
+                filter.ToDate = DateTime.Today;
+            }
+            else if (request.Contains("tuần này") || request.Contains("week"))
+            {
+                filter.FromDate = DateTime.Today.AddDays(-7);
+                filter.ToDate = DateTime.Today.AddDays(1);
+            }
+            else if (request.Contains("tháng này") || request.Contains("month"))
+            {
+                filter.FromDate = new DateTime(now.Year, now.Month, 1);
+                filter.ToDate = filter.FromDate.Value.AddMonths(1);
+            }
+            // Parse specific month: "tháng 11", "tháng 12"
+            else if (request.Contains("tháng "))
+            {
+                var parts = request.Split("tháng");
+                if (parts.Length > 1 && int.TryParse(parts[1].Trim().Split()[0], out int month))
+                {
+                    if (month >= 1 && month <= 12)
+                    {
+                        var year = now.Year;
+                        if (month > now.Month) year--; // Nếu tháng > hiện tại, lấy năm trước
+
+                        filter.FromDate = new DateTime(year, month, 1);
+                        filter.ToDate = filter.FromDate.Value.AddMonths(1);
+                    }
+                }
+            }
+            // Parse specific year: "năm 2024"
+            else if (request.Contains("năm "))
+            {
+                var parts = request.Split("năm");
+                if (parts.Length > 1 && int.TryParse(parts[1].Trim().Split()[0], out int year))
+                {
+                    filter.FromDate = new DateTime(year, 1, 1);
+                    filter.ToDate = new DateTime(year, 12, 31).AddDays(1);
+                }
+            }
+            else
+            {
+                // Default: today
+                filter.FromDate = DateTime.Today;
+                filter.ToDate = DateTime.Today.AddDays(1);
+            }
+        }
+
+        private void ParseLimit(string request, QueryFilter filter)
+        {
+            // "Top 5", "Top 10", "top 20"
+            if (request.Contains("top "))
+            {
+                var parts = request.Split("top");
+                if (parts.Length > 1)
+                {
+                    var numberStr = System.Text.RegularExpressions.Regex.Match(parts[1], @"\d+").Value;
+                    if (int.TryParse(numberStr, out int limit))
+                        filter.Limit = Math.Min(limit, 100);
+                }
+            }
+        }
+
+        private List<string> ExtractKeywords(string request)
+        {
+            var keywords = new List<string>();
+            // Extract keywords between quotes or specific patterns
+            var pattern = @"'([^']*)'|""([^""]*)""";
+            var matches = System.Text.RegularExpressions.Regex.Matches(request, pattern);
+            foreach (System.Text.RegularExpressions.Match match in matches)
+            {
+                keywords.Add(match.Groups[1].Value ?? match.Groups[2].Value);
+            }
+            return keywords;
+        }
+
+        private async Task<object> GetRevenueDataAsync(QueryFilter filter)
+        {
+            var query = _context.Invoices
+                .Where(i => i.Status == "Paid"
+                         && i.CreatedAt >= filter.FromDate
+                         && i.CreatedAt < filter.ToDate);
+
+            var dailyRevenue = await query
+                .GroupBy(i => i.CreatedAt.Date)
+                .Select(g => new
+                {
+                    date = g.Key,
+                    revenue = g.Sum(i => (decimal?)i.Amount) ?? 0,
+                    count = g.Count()
+                })
+                .OrderBy(x => x.date)
+                .ToListAsync();
+
+            var totalRevenue = dailyRevenue.Sum(x => x.revenue);
+            var avgDaily = dailyRevenue.Count > 0 ? totalRevenue / dailyRevenue.Count : 0;
+
+            return new
+            {
+                period = new { from = filter.FromDate, to = filter.ToDate },
+                totalRevenue = totalRevenue,
+                dailyAverage = avgDaily,
+                dailyBreakdown = dailyRevenue,
+                totalDays = dailyRevenue.Count,
+                summary = $"Tổng doanh thu từ {filter.FromDate:dd/MM/yyyy} đến {filter.ToDate:dd/MM/yyyy}: {totalRevenue:N0} VNĐ ({dailyRevenue.Count} ngày)"
+            };
+        }
+
+        private async Task<object> GetItemsDataAsync(QueryFilter filter)
+        {
+            var query = _context.OrderDetails
+                .Include(od => od.MenuItem)
+                .Where(od => od.CreatedAt >= filter.FromDate && od.CreatedAt < filter.ToDate);
+
+            var items = await query
+                .GroupBy(od => new { od.MenuItemId, od.MenuItem.Name })
+                .Select(g => new
+                {
+                    itemId = g.Key.MenuItemId,
+                    itemName = g.Key.Name,
+                    quantity = g.Sum(od => od.Quantity),
+                    revenue = g.Sum(od => od.Quantity * od.UnitPrice),
+                    avgPrice = g.Average(od => od.UnitPrice)
+                })
+                .OrderByDescending(x => x.quantity)
+                .Take(filter.Limit ?? 10)
+                .ToListAsync();
+
+            var totalItems = items.Sum(x => x.quantity);
+
+            return new
+            {
+                period = new { from = filter.FromDate, to = filter.ToDate },
+                topItems = items,
+                totalItemsSold = totalItems,
+                totalRevenue = items.Sum(x => x.revenue),
+                summary = $"Top {Math.Min(items.Count, filter.Limit ?? 10)} món bán chạy nhất: {string.Join(", ", items.Select(x => $"{x.itemName} ({x.quantity} cái)"))}"
+            };
+        }
+
+        private async Task<object> GetTablesDataAsync(QueryFilter filter)
+        {
+            var tables = await _context.Tables
+                .Where(t => t.IsActive)
+                .Select(t => new
+                {
+                    t.Id,
+                    t.TableNumber,
+                    t.TableName,
+                    t.Capacity,
+                    t.Location,
+                    t.Status
+                })
+                .ToListAsync();
+
+            var statusBreakdown = tables
+                .GroupBy(t => t.Status)
+                .Select(g => new { status = g.Key, count = g.Count() })
+                .ToList();
+
+            var availableCount = tables.Count(t => t.Status == "Available");
+
+            return new
+            {
+                totalTables = tables.Count,
+                availableTables = availableCount,
+                busyTables = tables.Count(t => t.Status == "Occupied"),
+                statusBreakdown = statusBreakdown,
+                tables = tables.Take(filter.Limit ?? 20),
+                summary = $"Có {availableCount}/{tables.Count} bàn trống, {tables.Count(t => t.Status == "Occupied")} bàn đang sử dụng"
+            };
+        }
+
+        private async Task<object> GetReservationsDataAsync(QueryFilter filter)
+        {
+            var query = _context.Reservations
+                .Where(r => r.ReservationTime >= filter.FromDate && r.ReservationTime < filter.ToDate);
+
+            var reservations = await query
+                .Select(r => new
+                {
+                    r.Id,
+                    r.ReservationNumber,
+                    r.CustomerName,
+                    r.CustomerPhone,
+                    r.NumberOfGuests,
+                    r.ReservationTime,
+                    r.Status
+                })
+                .OrderByDescending(r => r.ReservationTime)
+                .Take(filter.Limit ?? 20)
+                .ToListAsync();
+
+            // Mask customer info
+            var maskedReservations = reservations.Select(r => new
+            {
+                r.Id,
+                r.ReservationNumber,
+                CustomerName = _maskingService.MaskCustomerName(r.CustomerName ?? ""),
+                CustomerPhone = _maskingService.MaskPhoneNumber(r.CustomerPhone ?? ""),
+                r.NumberOfGuests,
+                r.ReservationTime,
+                r.Status
+            }).ToList();
+
+            var statusCount = await query
+                .GroupBy(r => r.Status)
+                .Select(g => new { status = g.Key, count = g.Count() })
+                .ToListAsync();
+
+            return new
+            {
+                period = new { from = filter.FromDate, to = filter.ToDate },
+                totalReservations = await query.CountAsync(),
+                statusBreakdown = statusCount,
+                reservations = maskedReservations,
+                summary = $"Tổng {await query.CountAsync()} đặt bàn từ {filter.FromDate:dd/MM/yyyy} đến {filter.ToDate:dd/MM/yyyy}"
+            };
+        }
+
+        private async Task<object> GetOrdersDataAsync(QueryFilter filter)
+        {
+            var query = _context.Orders
+                .Where(o => o.OrderTime >= filter.FromDate && o.OrderTime < filter.ToDate);
+
+            var orders = await query
+                .Select(o => new
+                {
+                    o.Id,
+                    o.OrderNumber,
+                    o.NumberOfGuests,
+                    o.TotalAmount,
+                    o.Status,
+                    o.OrderTime
+                })
+                .OrderByDescending(o => o.OrderTime)
+                .Take(filter.Limit ?? 20)
+                .ToListAsync();
+
+            var statusCount = await query
+                .GroupBy(o => o.Status)
+                .Select(g => new { status = g.Key, count = g.Count() })
+                .ToListAsync();
+
+            return new
+            {
+                period = new { from = filter.FromDate, to = filter.ToDate },
+                totalOrders = await query.CountAsync(),
+                totalRevenue = await query.SumAsync(o => (decimal?)o.TotalAmount) ?? 0,
+                avgOrderValue = await query.CountAsync() > 0 
+                    ? (await query.SumAsync(o => (decimal?)o.TotalAmount) ?? 0) / await query.CountAsync()
+                    : 0,
+                statusBreakdown = statusCount,
+                orders = orders,
+                summary = $"Tổng {await query.CountAsync()} đơn từ {filter.FromDate:dd/MM/yyyy} đến {filter.ToDate:dd/MM/yyyy}"
+            };
+        }
+
+        private async Task<object> GetPromotionsDataAsync(QueryFilter filter)
+        {
+            var promotions = await _context.Promotions
+                .Where(p => p.StartDate <= DateTime.UtcNow && p.EndDate >= DateTime.UtcNow)
+                .Select(p => new
+                {
+                    p.Id,
+                    p.Code,
+                    p.Name,
+                    p.Description,
+                    p.DiscountPercent,
+                    p.DiscountAmount,
+                    p.Active,
+                    p.StartDate,
+                    p.EndDate,
+                    usageCount = p.PromotionUsages.Count
+                })
+                .OrderByDescending(p => p.usageCount)
+                .Take(filter.Limit ?? 10)
+                .ToListAsync();
+
+            return new
+            {
+                period = new { from = filter.FromDate, to = filter.ToDate },
+                totalPromotions = promotions.Count,
+                activePromotions = promotions.Count(p => p.Active),
+                promotions = promotions,
+                summary = $"Có {promotions.Count(p => p.Active)} khuyến mãi đang hoạt động"
+            };
+        }
+
+        private async Task<object> GetStaffDataAsync(QueryFilter filter)
+        {
+            var staffOrders = await _context.Orders
+                .Where(o => o.OrderTime >= filter.FromDate && o.OrderTime < filter.ToDate)
+                .GroupBy(o => new { o.StaffId, o.Staff.FullName })
+                .Select(g => new
+                {
+                    staffId = g.Key.StaffId,
+                    staffName = g.Key.FullName,
+                    orderCount = g.Count(),
+                    totalRevenue = g.Sum(o => o.TotalAmount),
+                    avgOrderValue = g.Average(o => o.TotalAmount)
+                })
+                .OrderByDescending(x => x.totalRevenue)
+                .Take(filter.Limit ?? 10)
+                .ToListAsync();
+
+            return new
+            {
+                period = new { from = filter.FromDate, to = filter.ToDate },
+                staffPerformance = staffOrders,
+                topStaff = staffOrders.FirstOrDefault(),
+                summary = $"Nhân viên hàng đầu: {staffOrders.FirstOrDefault()?.staffName} với {staffOrders.FirstOrDefault()?.orderCount} đơn"
+            };
+        }
+    }
+}

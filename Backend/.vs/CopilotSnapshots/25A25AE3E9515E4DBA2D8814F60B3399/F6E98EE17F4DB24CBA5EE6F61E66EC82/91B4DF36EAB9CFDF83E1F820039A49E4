@@ -1,0 +1,803 @@
+﻿using Microsoft.AspNetCore.Antiforgery;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.Tokens;
+using Restaurant_Management.Data;
+using Restaurant_Management.DTO.Auth;
+using Restaurant_Management.Helpers;
+using Restaurant_Management.Models.Entities;
+using Restaurant_Management.Services.Email;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using System.Security.Cryptography;
+using System.Text;
+
+namespace Restaurant_Management.Controllers
+{
+    [Route("api/[controller]")]
+    [ApiController]
+    public class AuthController : ControllerBase
+    {
+        private readonly RestaurantDbContext _context;
+        private readonly IConfiguration _config;
+        private readonly ILogger<AuthController> _logger;
+        private readonly string _pepper;
+        private readonly string _jwtkey;
+        private readonly string _jwtiss;
+        private readonly string _jwtAu;
+        private readonly IEmailService _emailService;
+        private readonly IAntiforgery _antiforgery;
+
+        // ✅ Thời gian sống tokens
+        private const int ACCESS_TOKEN_MINUTES = 15;
+        private const int REFRESH_TOKEN_DAYS = 7;
+        private const int INACTIVITY_TIMEOUT_MINUTES = 30;
+        private const int MAX_REFRESH_ATTEMPTS = 10;
+
+        public AuthController(
+            RestaurantDbContext context,
+            IConfiguration config,
+            IEmailService emailService,
+            ILogger<AuthController> logger,
+            IAntiforgery antiforgery)
+        {
+            _context = context ?? throw new ArgumentNullException(nameof(context));
+            _config = config ?? throw new ArgumentNullException(nameof(config));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _pepper = Environment.GetEnvironmentVariable("APP_PEPPER") ?? _config["Security:Pepper"] ?? "";
+            _jwtkey = Environment.GetEnvironmentVariable("JWT_KEY") ?? _config["JWT_KEY"] ?? "";
+            _jwtiss = Environment.GetEnvironmentVariable("JWT_ISSUER") ?? _config["Jwt:Issuer"] ?? "";
+            _jwtAu = Environment.GetEnvironmentVariable("JWT_AUDIENCE") ?? _config["Jwt:Audience"] ?? "";
+            _emailService = emailService ?? throw new ArgumentNullException(nameof(emailService));
+            _antiforgery = antiforgery;
+        }
+
+        #region Authentication Endpoints
+
+        // AuthController.cs - Method GetCurrentUser() //no fix everything
+
+        [HttpGet("me")]
+        [Authorize]
+        public async Task<IActionResult> GetCurrentUser()
+        {
+            try
+            {                        
+                var userIdClaim = User.FindFirst(ClaimTypes.NameIdentifier)?.Value
+                               ?? User.FindFirst("id")?.Value;
+
+                if (string.IsNullOrEmpty(userIdClaim))
+                {
+                    return Unauthorized(new { message = "Invalid user token" });
+                }
+                
+                var username = User.FindFirst(ClaimTypes.Name)?.Value
+                            ?? User.FindFirst("username")?.Value
+                            ?? User.FindFirst("sub")?.Value;
+
+                var user = await _context.Users
+                    .Where(u => u.Username == userIdClaim)
+                    .Select(u => new
+                    {
+                        username = u.Username,
+                        role = u.Role.ToString(),
+                        fullname = u.FullName,
+                       
+                    })
+                    .FirstOrDefaultAsync();
+
+                if (user == null)
+                {
+                    return NotFound(new { message = "Không tìm thấy người dùng" });
+                }
+
+                return Ok(user);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Hãy kiểm tra lại người dùng này");
+                return StatusCode(500, new { message = "Internal server error" });
+            }
+        }
+
+        /// Đăng nhập - Tạo access token và refresh token với device binding
+
+        [AllowAnonymous]
+        [HttpPost("login")]
+        public async Task<IActionResult> Login([FromBody] LoginRequestDto request)
+        {
+            if (!ModelState.IsValid)
+                return BadRequest(ModelState);
+
+            var user = await _context.Users
+                .FirstOrDefaultAsync(u => (u.Username == request.Username || u.Email == request.Username) && u.IsActive);
+
+            if (user == null || !PasswordHasher.VerifyPassword(request.Password + _pepper, user.PasswordHash))
+            {
+                return Unauthorized(new { message = "Tên đăng nhập hoặc mật khẩu không đúng" });
+            }
+
+            var deviceFingerprint = GenerateDeviceFingerprint();
+            var deviceName = GetDeviceName();
+           
+            var existingToken = await _context.RefreshTokens
+                .FirstOrDefaultAsync(rt =>
+                    rt.UserId == user.Id &&
+                    rt.DeviceFingerprint == deviceFingerprint &&
+                    !rt.IsRevoked);
+
+            
+            using var tx = await _context.Database.BeginTransactionAsync();
+            try
+            {               
+                if (existingToken != null)
+                {
+                    existingToken.IsRevoked = true;
+                    existingToken.RevokedAt = DateTime.UtcNow;
+                    existingToken.RevokeReason = "Re-login from same device";
+                    _logger.LogInformation($"User {user.Id} re-login from device {deviceName}");
+                    
+                }
+
+                var accessToken = GenerateJwtToken(user, ACCESS_TOKEN_MINUTES);
+                var refreshToken = await GenerateRefreshToken(user, deviceFingerprint, deviceName); // this saves the new refresh token
+
+               
+                if (existingToken == null)
+                {
+                    _ = Task.Run(async () => await NotifyNewDeviceLogin(user, deviceName));
+                }
+              
+                SetTokenCookies(accessToken, refreshToken.Token);
+
+                await tx.CommitAsync();
+
+                return Ok(new
+                {
+                    user = new
+                    {                        
+                        token = accessToken
+                    },
+                    username = user.Username,
+                    role = user.Role.ToString(),
+                    message = "Login successful"
+                });
+            }
+            catch (Exception ex)
+            {
+                await tx.RollbackAsync();
+                _logger.LogError(ex, "Login failed");
+                return StatusCode(500, new { message = "Internal server error" });
+            }
+        }   
+
+        /// Refresh Access Token với device validation và token rotation
+        [AllowAnonymous]
+        [HttpPost("refresh-token")]
+        public async Task<IActionResult> RefreshToken()
+        {
+            var refreshTokenValue = Request.Cookies["refreshToken"];
+
+            if (string.IsNullOrEmpty(refreshTokenValue))
+            {
+                return Unauthorized(new { message = "Refresh token không tồn tại" });
+            }
+
+            // Hash token để tìm trong database
+            var hashedToken = HashToken(refreshTokenValue);
+
+            var refreshToken = await _context.RefreshTokens
+                .Include(rt => rt.User)
+                .FirstOrDefaultAsync(rt => rt.Token == hashedToken);
+
+         
+            if (refreshToken == null)
+            {
+                _logger.LogWarning("Refresh token not found");
+                return Unauthorized(new { message = "Refresh token không hợp lệ" });
+            }
+
+            
+            if (refreshToken.IsRevoked)
+            {
+                _logger.LogWarning($"TOKEN REUSE DETECTED! User: {refreshToken.UserId}, Device: {refreshToken.DeviceName}");
+              
+                await RevokeAllUserTokens(refreshToken.UserId, "Security: Token reuse detected");
+              
+                _ = Task.Run(async () => await SendSecurityAlert(refreshToken.User, "Phát hiện token reuse"));
+
+                return Unauthorized(new
+                {
+                    message = "Phát hiện hoạt động bất thường. Tất cả phiên đăng nhập đã bị đăng xuất. Vui lòng đổi mật khẩu!"
+                });
+            }
+
+
+            if (refreshToken.ExpiresAt < DateTime.UtcNow)
+            {
+                return Unauthorized(new { message = "Refresh token đã hết hạn" });
+            }
+
+            
+            if (!refreshToken.User.IsActive)
+            {
+                return Unauthorized(new { message = "Tài khoản đã bị vô hiệu hóa" });
+            }
+
+          
+            var inactiveTime = DateTime.UtcNow - refreshToken.LastUsedAt;
+            if (inactiveTime.TotalMinutes > INACTIVITY_TIMEOUT_MINUTES)
+            {
+                refreshToken.IsRevoked = true;
+                refreshToken.RevokedAt = DateTime.UtcNow;
+                refreshToken.RevokeReason = "Inactivity timeout";
+                await _context.SaveChangesAsync();
+
+                _logger.LogInformation($"Token expired due to inactivity. User: {refreshToken.UserId}");
+
+                return Unauthorized(new
+                {
+                    message = "Phiên làm việc đã hết hạn do không hoạt động. Vui lòng đăng nhập lại."
+                });
+            }
+
+            
+            var currentFingerprint = GenerateDeviceFingerprint();
+            if (refreshToken.DeviceFingerprint != currentFingerprint)
+            {
+                _logger.LogWarning($"⚠️ TOKEN USED FROM DIFFERENT DEVICE! User: {refreshToken.UserId}, Original: {refreshToken.DeviceName}, Current: {GetDeviceName()}");
+
+                
+                await RevokeAllUserTokens(refreshToken.UserId, "Security: Different device detected");
+
+                
+                _ = Task.Run(async () => await SendSecurityAlert(refreshToken.User, "Token được sử dụng từ thiết bị khác"));
+
+                return Unauthorized(new
+                {
+                    message = "⚠️ Phát hiện đăng nhập từ thiết bị khác. Tất cả phiên đăng nhập đã bị đăng xuất!"
+                });
+            }
+
+           
+            var recentRefreshCount = await _context.RefreshTokens
+                .CountAsync(rt =>
+                    rt.UserId == refreshToken.UserId &&
+                    rt.CreatedAt >= DateTime.UtcNow.AddMinutes(-5));
+
+            if (recentRefreshCount > MAX_REFRESH_ATTEMPTS)
+            {
+                _logger.LogWarning($"⚠️ TOO MANY REFRESH ATTEMPTS! User: {refreshToken.UserId}");
+
+                return StatusCode(429, new
+                {
+                    message = "Quá nhiều yêu cầu. Vui lòng thử lại sau 5 phút."
+                });
+            }
+
+            
+            var newAccessToken = GenerateJwtToken(refreshToken.User, ACCESS_TOKEN_MINUTES);
+            var newRefreshToken = await GenerateRefreshToken(
+                refreshToken.User,
+                refreshToken.DeviceFingerprint,
+                refreshToken.DeviceName);
+
+            // Revoke token cũ (Token Rotation)
+            refreshToken.IsRevoked = true;
+            refreshToken.RevokedAt = DateTime.UtcNow;
+            refreshToken.RevokeReason = "Token rotation";
+            await _context.SaveChangesAsync();
+
+            // Gửi tokens mới
+            SetTokenCookies(newAccessToken, newRefreshToken.Token);
+
+            _logger.LogInformation($"Token refreshed successfully. User: {refreshToken.UserId}");
+
+            return Ok(new RefreshTokenResponseDto
+            {
+                AccessTokenExpiration = DateTime.UtcNow.AddMinutes(ACCESS_TOKEN_MINUTES)
+            });
+        }
+
+       
+        /// Đăng xuất - Revoke refresh token hiện tại
+       
+        [Authorize]
+        [HttpPost("logout")]
+        public async Task<IActionResult> Logout()
+        {
+            var refreshTokenValue = Request.Cookies["refreshToken"];
+
+            if (!string.IsNullOrEmpty(refreshTokenValue))
+            {
+                var hashedToken = HashToken(refreshTokenValue);
+                var refreshToken = await _context.RefreshTokens
+                    .FirstOrDefaultAsync(rt => rt.Token == hashedToken);
+
+                if (refreshToken != null && !refreshToken.IsRevoked)
+                {
+                    refreshToken.IsRevoked = true;
+                    refreshToken.RevokedAt = DateTime.UtcNow;
+                    refreshToken.RevokeReason = "User logout";
+                    await _context.SaveChangesAsync();
+
+                    _logger.LogInformation($"User {refreshToken.UserId} logged out from device {refreshToken.DeviceName}");
+                }
+            }
+
+            ClearTokenCookies();
+            return Ok(new LogoutResponseDto { Message = "Đăng xuất thành công" });
+        }
+
+       
+        /// Revoke tất cả tokens của user (đăng xuất khỏi tất cả thiết bị)
+       
+        [Authorize]
+        [HttpPost("revoke-all-tokens")]
+        public async Task<IActionResult> RevokeAllTokens()
+        {
+            var userId = int.Parse(User.FindFirst(ClaimTypes.NameIdentifier)?.Value ?? "0");
+
+            var count = await RevokeAllUserTokens(userId, "Security: All tokens revoked by user");
+
+            ClearTokenCookies();
+
+            _logger.LogInformation($"User {userId} revoked all tokens manually");
+
+            return Ok(new
+            {
+                message = $"Đã đăng xuất khỏi {count} thiết bị thành công"
+            });
+        }
+
+        
+        [HttpGet("csrf-token")]
+        [AllowAnonymous]
+        public IActionResult GetCsrfToken()
+        {
+            var tokens = _antiforgery.GetAndStoreTokens(HttpContext);
+            Response.Cookies.Append("XSRF-TOKEN", tokens.RequestToken!, new CookieOptions
+            {
+                HttpOnly = false, 
+                Secure = true,
+                SameSite = SameSiteMode.None
+            });
+
+            return Ok(new { message = "CSRF token set" });
+        }
+
+
+        /// Lấy danh sách các thiết bị đang đăng nhập
+
+        [Authorize]
+        [HttpGet("active-sessions")]
+        public async Task<IActionResult> GetActiveSessions()
+        {
+            var userId = int.Parse(User.FindFirst(ClaimTypes.NameIdentifier)?.Value ?? "0");
+
+            var sessions = await _context.RefreshTokens
+                .Where(rt => rt.UserId == userId && !rt.IsRevoked && rt.ExpiresAt > DateTime.UtcNow)
+                .OrderByDescending(rt => rt.LastUsedAt)
+                .Select(rt => new
+                {
+                    rt.Id,
+                    rt.DeviceName,
+                    rt.IpAddress,
+                    rt.CreatedAt,
+                    rt.LastUsedAt,
+                    rt.ExpiresAt,
+                    IsCurrent = rt.DeviceFingerprint == GenerateDeviceFingerprint()
+                })
+                .ToListAsync();
+
+            return Ok(sessions);
+        }
+
+       
+        /// Revoke một session cụ thể
+       
+        [Authorize]
+        [HttpPost("revoke-session/{sessionId}")]
+        public async Task<IActionResult> RevokeSession(int sessionId)
+        {
+            var userId = int.Parse(User.FindFirst(ClaimTypes.NameIdentifier)?.Value ?? "0");
+
+            var session = await _context.RefreshTokens
+                .FirstOrDefaultAsync(rt => rt.Id == sessionId && rt.UserId == userId);
+
+            if (session == null)
+            {
+                return NotFound(new { message = "Phiên đăng nhập không tồn tại" });
+            }
+
+            session.IsRevoked = true;
+            session.RevokedAt = DateTime.UtcNow;
+            session.RevokeReason = "Revoked by user";
+            await _context.SaveChangesAsync();
+
+            return Ok(new { message = $"Đã đăng xuất khỏi thiết bị {session.DeviceName}" });
+        }
+
+        #endregion
+
+        #region Password Management
+
+        [AllowAnonymous]
+        [HttpPost("forgot-password")]
+        public async Task<IActionResult> ForgotPassword([FromBody] ForgotPasswordDTO request)
+        {
+            if (!ModelState.IsValid)
+                return BadRequest(ModelState);
+
+            var user = await _context.Users.FirstOrDefaultAsync(u => u.Email == request.Email);
+            if (user == null)
+            {
+                return Ok(new
+                {
+                    message = "Nếu email tồn tại, link khôi phục đã được gửi."
+                });
+            }
+
+            var resetToken = GenerateSecureToken();
+            user.ResetToken = resetToken;
+            user.ResetTokenExpiry = DateTime.UtcNow.AddMinutes(15);
+
+            await _context.SaveChangesAsync();
+
+            var frontendUrl = _config["Frontend:ResetPasswordUrl"] ?? "http://localhost:5173/reset-password";
+            var resetLink = $"{frontendUrl}?token={resetToken}&email={request.Email}";
+
+            var emailBody = $@"
+                    <table width='100%' cellpadding='0' cellspacing='0' style='background:#f5f5f7;padding:40px 0;font-family:Arial,Helvetica,sans-serif;'>
+                      <tr>
+                        <td align='center'>
+                          <table width='560' cellpadding='0' cellspacing='0' style='background:white;border-radius:12px;overflow:hidden;box-shadow:0 4px 12px rgba(0,0,0,0.08);'>
+        
+                            <!-- Header -->
+                            <tr>
+                              <td style='background:#d32f2f;padding:24px;text-align:center;color:white;font-size:22px;font-weight:600;'>
+                                Khôi Phục Mật Khẩu
+                              </td>
+                            </tr>
+
+                            <!-- Body -->
+                            <tr>
+                              <td style='padding:32px;font-size:15px;color:#333;line-height:1.7;'>
+                                <p style='margin:0 0 16px;'>Chào <strong>{user.Username}</strong>,</p>
+                                <p style='margin:0 0 16px;'>
+                                  Hệ thống nhận được yêu cầu đặt lại mật khẩu cho tài khoản của bạn.
+                                  Nếu bạn là người thực hiện, vui lòng nhấn nút bên dưới để tiếp tục.
+                                </p>
+
+                                <!-- Button -->
+                                <p style='text-align:center;margin:32px 0;'>
+                                  <a href='{resetLink}' 
+                                     style='padding:14px 28px;background:#d32f2f;color:white;
+                                            text-decoration:none;font-size:16px;border-radius:6px;
+                                            font-weight:600;display:inline-block;'>
+                                    Đặt lại mật khẩu
+                                  </a>
+                                </p>
+
+                                <p style='margin:0 0 16px;color:#444;'>
+                                  Link sẽ <strong>hết hạn trong 15 phút</strong>.</p>                             
+
+                                <p style='margin:24px 0 0;font-size:14px;color:#666;'>
+                                  Nếu bạn không thực hiện yêu cầu này, bạn có thể bỏ qua email.  
+                                  Tài khoản của bạn vẫn an toàn.
+                                </p>
+                              </td>
+                            </tr>
+
+                            <!-- Footer -->
+                            <tr>
+                              <td style='padding:20px 32px;text-align:center;font-size:12px;color:#999;background:#fafafa;'>
+                                © {DateTime.UtcNow.Year} Restaurant Management System.  
+                                All rights reserved.
+                              </td>
+                            </tr>
+
+                          </table>
+                        </td>
+                      </tr>
+                    </table>";
+            try
+            {
+                await _emailService.SendEmailAsync(request.Email, "Yêu cầu khôi phục mật khẩu", emailBody);
+                return Ok(new { message = "Link khôi phục đã được gửi qua email." });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to send reset password email");
+                return StatusCode(500, new { message = "Gửi email thất bại" });
+            }
+        }
+
+        [AllowAnonymous]
+        [HttpPost("reset-password")]
+        public async Task<IActionResult> ResetPassword([FromBody] ResetPasswordDTO request)
+        {
+            if (!ModelState.IsValid)
+                return BadRequest(ModelState);
+
+            var user = await _context.Users.FirstOrDefaultAsync(u => u.Email == request.Email);
+
+            if (user == null ||
+                string.IsNullOrEmpty(user.ResetToken) ||
+                user.ResetToken != request.Token ||
+                !user.ResetTokenExpiry.HasValue ||
+                user.ResetTokenExpiry.Value < DateTime.UtcNow)
+            {
+                return BadRequest(new { message = "Mã xác thực không hợp lệ hoặc đã hết hạn" });
+            }
+
+            user.PasswordHash = PasswordHasher.HashPassword(request.NewPassword + _pepper);
+            user.ResetToken = null;
+            user.ResetTokenExpiry = null;
+            user.UpdatedAt = DateTime.UtcNow;
+
+            
+            await RevokeAllUserTokens(user.Id, "Password reset");
+
+            await _context.SaveChangesAsync();
+
+            _logger.LogInformation($"User {user.Id} reset password successfully");
+
+            return Ok(new { message = "Đặt lại mật khẩu thành công. Vui lòng đăng nhập lại." });
+        }
+
+        #endregion
+
+        #region Helper Methods
+
+       
+        /// Tạo JWT Access Token
+       
+        private string GenerateJwtToken(User user, int expirationMinutes)
+        {
+            var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_jwtkey));
+            var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
+
+            var claims = new[]
+            {
+                new Claim(JwtRegisteredClaimNames.Sub, user.Username),
+                new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()),
+                new Claim("username", user.Username),
+                new Claim("role", user.Role.ToString()),
+                new Claim("fullname", user.FullName ?? string.Empty),
+                new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString())
+            };
+
+            var token = new JwtSecurityToken(
+                issuer: _jwtiss,
+                audience: _jwtAu,
+                claims: claims,
+                expires: DateTime.UtcNow.AddMinutes(expirationMinutes),
+                signingCredentials: creds
+            );
+
+            return new JwtSecurityTokenHandler().WriteToken(token);
+        }
+
+       
+        /// Tạo Refresh Token với device binding
+       
+        private async Task<RefreshToken> GenerateRefreshToken(User user, string deviceFingerprint, string deviceName)
+        {
+            var rawToken = GenerateSecureToken();
+
+            var refreshToken = new RefreshToken
+            {
+                UserId = user.Id,
+                Token = HashToken(rawToken), // Lưu hash
+                ExpiresAt = DateTime.UtcNow.AddDays(REFRESH_TOKEN_DAYS),
+                CreatedAt = DateTime.UtcNow,
+                LastUsedAt = DateTime.UtcNow,
+                IpAddress = GetClientIpAddress(),
+                UserAgent = Request.Headers["User-Agent"].ToString(),
+                DeviceFingerprint = deviceFingerprint,
+                DeviceName = deviceName
+            };
+
+            _context.RefreshTokens.Add(refreshToken);
+            await _context.SaveChangesAsync();
+
+          
+            refreshToken.Token = rawToken;
+            return refreshToken;
+        }
+
+       
+        /// Tạo device fingerprint từ User-Agent, IP, Accept-Language
+       
+        private string GenerateDeviceFingerprint()
+        {
+            var userAgent = Request.Headers["User-Agent"].ToString();
+            var ip = GetClientIpAddress();
+            var acceptLanguage = Request.Headers["Accept-Language"].ToString();
+
+            var raw = $"{userAgent}|{ip}|{acceptLanguage}";
+
+            using var sha256 = SHA256.Create();
+            var bytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(raw));
+            return Convert.ToBase64String(bytes);
+        }
+
+       
+        /// Lấy tên device từ User-Agent (Chrome on Windows, Safari on iPhone, ...)
+       
+        private string GetDeviceName()
+        {
+            var userAgent = Request.Headers["User-Agent"].ToString().ToLower();
+
+            string browser = "Unknown Browser";
+            string os = "Unknown OS";
+
+            // Detect browser
+            if (userAgent.Contains("edg")) browser = "Edge";
+            else if (userAgent.Contains("chrome")) browser = "Chrome";
+            else if (userAgent.Contains("safari")) browser = "Safari";
+            else if (userAgent.Contains("firefox")) browser = "Firefox";
+
+            // Detect OS
+            if (userAgent.Contains("windows")) os = "Windows";
+            else if (userAgent.Contains("mac")) os = "macOS";
+            else if (userAgent.Contains("linux")) os = "Linux";
+            else if (userAgent.Contains("android")) os = "Android";
+            else if (userAgent.Contains("iphone") || userAgent.Contains("ipad")) os = "iOS";
+
+            return $"{browser} on {os}";
+        }
+
+       
+        /// Hash token bằng SHA256
+       
+        private string HashToken(string token)
+        {
+            using var sha256 = SHA256.Create();
+            var bytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(token));
+            return Convert.ToBase64String(bytes);
+        }
+
+       
+        /// Tạo secure random token
+       
+        private string GenerateSecureToken()
+        {
+            var randomBytes = new byte[64];
+            using var rng = RandomNumberGenerator.Create();
+            rng.GetBytes(randomBytes);
+              var base64 = Convert.ToBase64String(randomBytes);
+           
+            return base64
+                .Replace('+', '-')  
+                .Replace('/', '_')  
+                .TrimEnd('=');      
+        }
+
+       
+        /// Lấy IP address của client
+       
+        private string GetClientIpAddress()
+        {
+            return Request.Headers.ContainsKey("X-Forwarded-For")
+                ? Request.Headers["X-Forwarded-For"].ToString().Split(',')[0].Trim()
+                : HttpContext.Connection.RemoteIpAddress?.ToString() ?? "Unknown";
+        }
+
+       
+        /// Revoke tất cả tokens của user
+       
+        private async Task<int> RevokeAllUserTokens(int userId, string reason)
+        {
+            var tokens = await _context.RefreshTokens
+                .Where(rt => rt.UserId == userId && !rt.IsRevoked)
+                .ToListAsync();
+
+            foreach (var token in tokens)
+            {
+                token.IsRevoked = true;
+                token.RevokedAt = DateTime.UtcNow;
+                token.RevokeReason = reason;
+            }
+
+            await _context.SaveChangesAsync();
+            return tokens.Count;
+        }
+
+       
+        /// Gửi email thông báo đăng nhập từ thiết bị mới
+       
+        private async Task NotifyNewDeviceLogin(User user, string deviceName)
+        {
+            var ipAddress = GetClientIpAddress();
+            var loginTime = DateTime.UtcNow.ToString("dd/MM/yyyy HH:mm:ss");
+
+            var emailBody = $@"
+                <p>Xin chào <strong>{user.Username}</strong>,</p>
+                <p>Tài khoản của bạn vừa được đăng nhập từ một thiết bị mới:</p>
+                <ul>
+                    <li><strong>Thiết bị:</strong> {deviceName}</li>
+                    <li><strong>Địa chỉ IP:</strong> {ipAddress}</li>
+                    <li><strong>Thời gian:</strong> {loginTime} UTC</li>
+                </ul>
+                <p>Nếu không phải bạn, vui lòng <strong>đổi mật khẩu ngay lập tức</strong> và liên hệ bộ phận hỗ trợ.</p>
+                <p style='color: #dc2626;'><strong>⚠️ Không chia sẻ mật khẩu với bất kỳ ai!</strong></p>";
+
+            try
+            {
+                await _emailService.SendEmailAsync(user.Email, "Cảnh báo đăng nhập mới", emailBody);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Failed to send new device notification to user {user.Id}");
+            }
+        }
+
+       
+        /// Gửi email cảnh báo bảo mật
+       
+        private async Task SendSecurityAlert(User user, string reason)
+        {
+            var emailBody = $@"                
+                <p>Xin chào <strong>{user.Username}</strong>,</p>
+                <p style='color: #dc2626;'><strong>Phát hiện hoạt động bất thường:</strong></p>
+                <p>{reason}</p>
+                <p><strong>Tất cả phiên đăng nhập đã bị đăng xuất để bảo vệ tài khoản của bạn.</strong></p>
+                <p>Vui lòng:</p>
+                <ol>
+                    <li>Đổi mật khẩu ngay lập tức</li>
+                    <li>Kiểm tra các hoạt động gần đây</li>
+                    <li>Liên hệ bộ phận hỗ trợ nếu cần</li>
+                </ol>";
+
+            try
+            {
+                await _emailService.SendEmailAsync(user.Email, "CẢNH BÁO BẢO MẬT", emailBody);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Failed to send security alert to user {user.Id}");
+            }
+        }
+
+
+        /// Set tokens vào HttpOnly Cookies
+        private void SetTokenCookies(string accessToken, string refreshToken)
+        {
+
+            bool isHttps = Request.IsHttps;
+
+            var refreshCookie = new CookieOptions
+            {
+                HttpOnly = true,
+                Secure = isHttps,
+                SameSite = isHttps ? SameSiteMode.None : SameSiteMode.Lax,
+                Expires = DateTime.UtcNow.AddDays(REFRESH_TOKEN_DAYS),
+                Path = "/"
+            };
+
+            var accessCookie = new CookieOptions
+            {
+                HttpOnly = true,
+                Secure = isHttps,
+                SameSite = isHttps ? SameSiteMode.None : SameSiteMode.Lax,
+                Expires = DateTime.UtcNow.AddMinutes(ACCESS_TOKEN_MINUTES),
+                Path = "/"
+            };
+
+            Response.Cookies.Append("accessToken", accessToken, accessCookie);
+            Response.Cookies.Append("refreshToken", refreshToken, refreshCookie);
+        }
+
+
+        /// Xóa token cookies
+        private void ClearTokenCookies()
+        {
+            Response.Cookies.Delete("accessToken");
+            Response.Cookies.Delete("refreshToken");
+        }
+
+        #endregion
+    }
+}

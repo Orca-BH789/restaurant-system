@@ -1,0 +1,25 @@
+namespace Restaurant_Management.Models.DTO
+{
+    public class CategoryDTO
+    {
+        public int Id { get; set; }
+        public string Name { get; set; } = string.Empty;
+        public string? Description { get; set; }
+        public string? ImageUrl { get; set; }
+
+
+        public List<MenuItemDto> MenuItems { get; set; } = new List<MenuItemDto>();
+    }
+
+ 
+    public class CategoryUpdateDto
+    {
+        public string Name { get; set; } = string.Empty;
+        public string? Description { get; set; }
+        public string? ImageFile { get; set; } // Base64 string
+        public string? FileName { get; set; }
+    }
+    
+
+
+}

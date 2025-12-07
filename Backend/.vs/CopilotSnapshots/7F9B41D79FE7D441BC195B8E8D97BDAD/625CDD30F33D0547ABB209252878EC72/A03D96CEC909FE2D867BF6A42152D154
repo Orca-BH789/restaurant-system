@@ -1,0 +1,511 @@
+﻿using Microsoft.EntityFrameworkCore;
+using Restaurant_Management.Data;
+using System.Security.Claims;
+
+namespace Restaurant_Management.Services.AI
+{
+    /// <summary>
+    /// Service cung c?p quy?n truy c?p toàn di?n cho ChatBot Assistant
+    /// Cho phép ChatBot ??c t?t c? d? li?u kinh doanh mà không c?n ki?m tra quy?n
+    /// Thông tin khách hàng ???c che d?u b?ng ICustomerDataMaskingService
+    /// </summary>
+    public interface IChatBotDataAccessService
+    {
+        /// <summary>
+        /// ChatBot có th? truy c?p t?t c? ??n hàng (không c?n filter by staff/user)
+        /// Thông tin khách hàng (tên, S?T) ???c che d?u
+        /// </summary>
+        Task<List<Models.Entities.Order>> GetAllOrdersForAnalyticsAsync();
+
+        /// <summary>
+        /// ChatBot có th? truy c?p t?t c? khuy?n mãi
+        /// </summary>
+        IQueryable<Models.Entities.Promotion> GetAllPromotions();
+
+        /// <summary>
+        /// ChatBot có th? truy c?p t?t c? menu items
+        /// </summary>
+        IQueryable<Models.Entities.MenuItem> GetAllMenuItems();
+
+        /// <summary>
+        /// ChatBot có th? truy c?p t?t c? bàn
+        /// </summary>
+        IQueryable<Models.Entities.Table> GetAllTables();
+
+        /// <summary>
+        /// ChatBot có th? truy c?p t?t c? hóa ??n
+        /// Thông tin khách hàng ???c che d?u
+        /// </summary>
+        Task<List<Models.Entities.Invoice>> GetAllInvoicesAsync();
+
+        /// <summary>
+        /// ChatBot có th? truy c?p l?ch s? giao d?ch
+        /// </summary>
+        IQueryable<Models.Entities.HistoryLog> GetHistoryLogs();
+
+        /// <summary>
+        /// ChatBot có th? xem th?ng kê t?ng quát
+        /// </summary>
+        Task<Dictionary<string, object>> GetBusinessSummaryAsync();
+
+        /// <summary>
+        /// Lấy bàn trống cho khách đặt bàn (dữ liệu công khai)
+        /// </summary>
+        Task<List<Models.Entities.Table>> GetAvailableTablesForBookingAsync(int numberOfGuests, DateTime reservationTime);
+
+        /// <summary>
+        /// Lấy menu items của nhà hàng cho khách (dữ liệu công khai)
+        /// </summary>
+        Task<List<Models.Entities.MenuItem>> GetPublicMenuItemsAsync(int? categoryId = null);
+
+        /// <summary>
+        /// Lấy danh mục menu cho khách (dữ liệu công khai)
+        /// </summary>
+        Task<List<Models.Entities.Category>> GetPublicCategoriesAsync();
+
+        /// <summary>
+        /// Lấy khuyến mãi của nhà hàng cho khách (dữ liệu công khai)
+        /// </summary>
+        Task<List<Models.Entities.Promotion>> GetPublicPromotionsAsync();
+
+        /// <summary>
+        /// Lấy thông tin sơ khai của nhà hàng (dữ liệu công khai)
+        /// </summary>
+        Task<Dictionary<string, object>> GetRestaurantPublicInfoAsync();
+
+        /// <summary>
+        /// ChatBot có thể truy cập tất cả chi phí cho phân tích
+        /// Chỉ đọc - không được thêm, xóa, sửa
+        /// </summary>
+        Task<List<Models.Entities.Expense>> GetAllExpensesAsync();
+
+        /// <summary>
+        /// Lấy chi phí theo danh mục
+        /// Chỉ đọc - không được thêm, xóa, sửa
+        /// </summary>
+        Task<List<Models.Entities.Expense>> GetExpensesByCategoryAsync(string category);
+
+        /// <summary>
+        /// Lấy chi phí theo trạng thái
+        /// Chỉ đọc - không được thêm, xóa, sửa
+        /// </summary>
+        Task<List<Models.Entities.Expense>> GetExpensesByStatusAsync(Models.Entities.ExpenseStatus status);
+
+        /// <summary>
+        /// Lấy chi phí trong khoảng thời gian
+        /// Chỉ đọc - không được thêm, xóa, sửa
+        /// </summary>
+        Task<List<Models.Entities.Expense>> GetExpensesByDateRangeAsync(DateTime startDate, DateTime endDate);
+
+        /// <summary>
+        /// Lấy tổng chi phí có thể khấu trừ trong khoảng thời gian
+        /// </summary>
+        Task<decimal> GetDeductibleExpensesTotalAsync(DateTime startDate, DateTime endDate);
+    }
+
+    public class ChatBotDataAccessService : IChatBotDataAccessService
+    {
+        private readonly RestaurantDbContext _context;
+        private readonly IChatBotAuthorizationHelper _authHelper;
+        private readonly ICustomerDataMaskingService _maskingService;
+
+        public ChatBotDataAccessService(
+            RestaurantDbContext context,
+            IChatBotAuthorizationHelper authHelper,
+            ICustomerDataMaskingService maskingService)
+        {
+            _context = context;
+            _authHelper = authHelper;
+            _maskingService = maskingService;
+        }
+
+        /// <summary>
+        /// L?y t?t c? ??n hàng cho phân tích (không filter by user/staff)
+        /// Thông tin khách hàng ???c che d?u
+        /// </summary>
+        public async Task<List<Models.Entities.Order>> GetAllOrdersForAnalyticsAsync()
+        {
+            var orders = await _context.Orders
+                .Include(o => o.Staff)
+                .Include(o => o.OrderDetails)
+                    .ThenInclude(od => od.MenuItem)
+                .Include(o => o.OrderTables)
+                    .ThenInclude(ot => ot.Table)
+                .Include(o => o.Invoices)
+                .AsNoTracking()
+                .ToListAsync();
+
+            // Che d?u thông tin khách hàng
+            return _maskingService.MaskOrdersCustomerInfo(orders);
+        }
+
+        /// <summary>
+        /// L?y t?t c? khuy?n mãi
+        /// </summary>
+        public IQueryable<Models.Entities.Promotion> GetAllPromotions()
+        {
+            return _context.Promotions
+                .Include(p => p.PromotionUsages)
+                .AsNoTracking();
+        }
+
+        /// <summary>
+        /// L?y t?t c? menu items
+        /// </summary>
+        public IQueryable<Models.Entities.MenuItem> GetAllMenuItems()
+        {
+            return _context.MenuItems
+                .Include(m => m.Category)
+                .AsNoTracking();
+        }
+
+        /// <summary>
+        /// L?y t?t c? bàn
+        /// </summary>
+        public IQueryable<Models.Entities.Table> GetAllTables()
+        {
+            return _context.Tables.AsNoTracking();
+        }
+
+        /// <summary>
+        /// L?y t?t c? hóa ??n
+        /// Thông tin khách hàng ???c che d?u
+        /// </summary>
+        public async Task<List<Models.Entities.Invoice>> GetAllInvoicesAsync()
+        {
+            var invoices = await _context.Invoices
+                .Include(i => i.Order)
+                    .ThenInclude(o => o.Staff)
+                .AsNoTracking()
+                .ToListAsync();
+
+            // Che d?u thông tin khách hàng
+            return _maskingService.MaskInvoicesCustomerInfo(invoices);
+        }
+
+        /// <summary>
+        /// L?y l?ch s? giao d?ch
+        /// </summary>
+        public IQueryable<Models.Entities.HistoryLog> GetHistoryLogs()
+        {
+            return _context.HistoryLogs.AsNoTracking();
+        }
+
+        /// <summary>
+        /// L?y th?ng kê t?ng quát cho ChatBot dashboard
+        /// </summary>
+        public async Task<Dictionary<string, object>> GetBusinessSummaryAsync()
+        {
+            try
+            {
+                var today = DateTime.Today;
+                var thisMonth = new DateTime(today.Year, today.Month, 1);
+
+                // Doanh thu hôm nay
+                var todayRevenue = await _context.Invoices
+                    .Where(i => i.CreatedAt.Date == today && i.Status == "Paid")
+                    .SumAsync(i => (decimal?)i.Amount) ?? 0;
+
+                // Doanh thu tháng này
+                var monthRevenue = await _context.Invoices
+                    .Where(i => i.CreatedAt >= thisMonth && i.Status == "Paid")
+                    .SumAsync(i => (decimal?)i.Amount) ?? 0;
+
+                // T?ng ??n hôm nay
+                var todayOrders = await _context.Orders
+                    .Where(o => o.OrderTime.Date == today)
+                    .CountAsync();
+
+                // Top 5 món bán ch?y nh?t
+                var topItems = await _context.OrderDetails
+                    .GroupBy(od => od.MenuItemId)
+                    .Select(g => new
+                    {
+                        MenuItemId = g.Key,
+                        TotalQuantity = g.Sum(od => od.Quantity),
+                        ItemName = g.FirstOrDefault()!.MenuItem!.Name
+                    })
+                    .OrderByDescending(x => x.TotalQuantity)
+                    .Take(5)
+                    .ToListAsync();
+
+                // T?ng khuy?n mãi ?ã dùng hôm nay
+                var promotionsToday = await _context.PromotionUsages
+                    .Where(pu => pu.UsedAt.Date == today)
+                    .CountAsync();
+
+                // Tr?ng thái bàn
+                var tableStats = await _context.Tables
+                    .GroupBy(t => t.Status)
+                    .Select(g => new { Status = g.Key, Count = g.Count() })
+                    .ToListAsync();
+
+                return new Dictionary<string, object>
+                {
+                    { "timestamp", DateTime.UtcNow },
+                    { "todayRevenue", todayRevenue },
+                    { "monthRevenue", monthRevenue },
+                    { "todayOrderCount", todayOrders },
+                    { "topSellingItems", topItems },
+                    { "promotionUsageToday", promotionsToday },
+                    { "tableStatus", tableStats },
+                    { "accessLevel", "ChatBot Full Analytics Access" }
+                };
+            }
+            catch (Exception ex)
+            {
+                return new Dictionary<string, object>
+                {
+                    { "error", ex.Message },
+                    { "timestamp", DateTime.UtcNow }
+                };
+            }
+        }
+
+        /// <summary>
+        /// Lấy bàn trống cho khách đặt bàn (dữ liệu công khai)
+        /// </summary>
+        public async Task<List<Models.Entities.Table>> GetAvailableTablesForBookingAsync(
+            int numberOfGuests, 
+            DateTime reservationTime)
+        {
+            try
+            {
+                var bufferStart = reservationTime.AddHours(-1);
+                var bufferEnd = reservationTime.AddHours(1);
+
+                var bookedTableIds = await _context.ReservationTables
+                    .Include(rt => rt.Reservation)
+                    .Where(rt => rt.Reservation.Status != "Cancelled" &&
+                                rt.Reservation.ReservationTime >= bufferStart &&
+                                rt.Reservation.ReservationTime <= bufferEnd)
+                    .Select(rt => rt.TableId)
+                    .Distinct()
+                    .ToListAsync();
+
+                var availableTables = await _context.Tables
+                    .Where(t => t.IsActive && 
+                           t.Capacity >= numberOfGuests &&
+                           !bookedTableIds.Contains(t.Id))
+                    .OrderBy(t => t.Capacity)
+                    .AsNoTracking()
+                    .ToListAsync();
+
+                return availableTables;
+            }
+            catch (Exception ex)
+            {
+                return new List<Models.Entities.Table>();
+            }
+        }
+
+        /// <summary>
+        /// Lấy menu items của nhà hàng cho khách (dữ liệu công khai)
+        /// </summary>
+        public async Task<List<Models.Entities.MenuItem>> GetPublicMenuItemsAsync(int? categoryId = null)
+        {
+            try
+            {
+                var query = _context.MenuItems
+                    .Include(m => m.Category)
+                    .Where(m => m.IsActive && m.IsAvailable);
+
+                if (categoryId.HasValue)
+                {
+                    query = query.Where(m => m.CategoryId == categoryId.Value);
+                }
+
+                return await query
+                    .OrderBy(m => m.SortOrder)
+                    .ThenBy(m => m.Name)
+                    .AsNoTracking()
+                    .ToListAsync();
+            }
+            catch (Exception ex)
+            {
+                return new List<Models.Entities.MenuItem>();
+            }
+        }
+
+        /// <summary>
+        /// Lấy danh mục menu cho khách (dữ liệu công khai)
+        /// </summary>
+        public async Task<List<Models.Entities.Category>> GetPublicCategoriesAsync()
+        {
+            try
+            {
+                return await _context.Categories
+                    .Where(c => c.IsActive)
+                    .OrderBy(c => c.SortOrder)
+                    .AsNoTracking()
+                    .ToListAsync();
+            }
+            catch (Exception ex)
+            {
+                return new List<Models.Entities.Category>();
+            }
+        }
+
+        /// <summary>
+        /// Lấy khuyến mãi của nhà hàng cho khách (dữ liệu công khai)
+        /// </summary>
+        public async Task<List<Models.Entities.Promotion>> GetPublicPromotionsAsync()
+        {
+            try
+            {
+                var today = DateTime.Today;
+
+                return await _context.Promotions
+                    .Where(p => p.Active && p.StartDate <= today && p.EndDate >= today)
+                    .OrderBy(p => p.StartDate)
+                    .AsNoTracking()
+                    .ToListAsync();
+            }
+            catch (Exception ex)
+            {
+                return new List<Models.Entities.Promotion>();
+            }
+        }
+
+        /// <summary>
+        /// Lấy thông tin sơ khai của nhà hàng (dữ liệu công khai)
+        /// </summary>
+        public async Task<Dictionary<string, object>> GetRestaurantPublicInfoAsync()
+        {
+            try
+            {
+                var tables = await _context.Tables
+                    .Where(t => t.IsActive)
+                    .AsNoTracking()
+                    .ToListAsync();
+
+                var totalTables = tables.Count;
+                var totalCapacity = tables.Sum(t => t.Capacity);
+                var avgTableCapacity = tables.Any() ? tables.Average(t => t.Capacity) : 0;
+
+                var categories = await _context.Categories
+                    .Where(c => c.IsActive)
+                    .CountAsync();
+
+                var menuItems = await _context.MenuItems
+                    .Where(m => m.IsActive && m.IsAvailable)
+                    .CountAsync();
+
+                return new Dictionary<string, object>
+                {
+                    { "totalTables", totalTables },
+                    { "totalCapacity", totalCapacity },
+                    { "avgTableCapacity", avgTableCapacity },
+                    { "totalCategories", categories },
+                    { "totalMenuItems", menuItems },
+                    { "operatingHours", "07:00 - 23:00" },
+                    { "timestamp", DateTime.UtcNow }
+                };
+            }
+            catch (Exception ex)
+            {
+                return new Dictionary<string, object>
+                {
+                    { "error", ex.Message },
+                    { "timestamp", DateTime.UtcNow }
+                };
+            }
+        }
+
+        /// <summary>
+        /// ChatBot có thể truy cập tất cả chi phí cho phân tích
+        /// Chỉ đọc - không được thêm, xóa, sửa
+        /// </summary>
+        public async Task<List<Models.Entities.Expense>> GetAllExpensesAsync()
+        {
+            try
+            {
+                return await _context.Expenses
+                    .Include(e => e.CreatedByUser)
+                    .AsNoTracking()
+                    .ToListAsync();
+            }
+            catch (Exception ex)
+            {
+                return new List<Models.Entities.Expense>();
+            }
+        }
+
+        /// <summary>
+        /// Lấy chi phí theo danh mục
+        /// Chỉ đọc - không được thêm, xóa, sửa
+        /// </summary>
+        public async Task<List<Models.Entities.Expense>> GetExpensesByCategoryAsync(string category)
+        {
+            try
+            {
+                return await _context.Expenses
+                    .Where(e => e.Category == category)
+                    .Include(e => e.CreatedByUser)
+                    .AsNoTracking()
+                    .ToListAsync();
+            }
+            catch (Exception ex)
+            {
+                return new List<Models.Entities.Expense>();
+            }
+        }
+
+        /// <summary>
+        /// Lấy chi phí theo trạng thái
+        /// Chỉ đọc - không được thêm, xóa, sửa
+        /// </summary>
+        public async Task<List<Models.Entities.Expense>> GetExpensesByStatusAsync(Models.Entities.ExpenseStatus status)
+        {
+            try
+            {
+                return await _context.Expenses
+                    .Where(e => e.Status == status)
+                    .Include(e => e.CreatedByUser)
+                    .AsNoTracking()
+                    .ToListAsync();
+            }
+            catch (Exception ex)
+            {
+                return new List<Models.Entities.Expense>();
+            }
+        }
+
+        /// <summary>
+        /// Lấy chi phí trong khoảng thời gian
+        /// Chỉ đọc - không được thêm, xóa, sửa
+        /// </summary>
+        public async Task<List<Models.Entities.Expense>> GetExpensesByDateRangeAsync(DateTime startDate, DateTime endDate)
+        {
+            try
+            {
+                return await _context.Expenses
+                    .Where(e => e.CreatedAt >= startDate && e.CreatedAt <= endDate)
+                    .Include(e => e.CreatedByUser)
+                    .AsNoTracking()
+                    .ToListAsync();
+            }
+            catch (Exception ex)
+            {
+                return new List<Models.Entities.Expense>();
+            }
+        }
+
+        /// <summary>
+        /// Lấy tổng chi phí có thể khấu trừ trong khoảng thời gian
+        /// </summary>
+        public async Task<decimal> GetDeductibleExpensesTotalAsync(DateTime startDate, DateTime endDate)
+        {
+            try
+            {
+                return await _context.Expenses
+                    .Where(e => e.IsDeductible && e.CreatedAt >= startDate && e.CreatedAt <= endDate)
+                    .SumAsync(e => (decimal?)e.Amount) ?? 0;
+            }
+            catch (Exception ex)
+            {
+                return 0;
+            }
+        }
+    }
+}

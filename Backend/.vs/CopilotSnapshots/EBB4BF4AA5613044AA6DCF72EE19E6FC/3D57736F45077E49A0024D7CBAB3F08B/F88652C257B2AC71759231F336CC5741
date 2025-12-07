@@ -1,0 +1,374 @@
+﻿using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using Restaurant_Management.Data;
+using Restaurant_Management.Models.Entities;
+using Restaurant_Management.Models.DTOs;
+using Restaurant_Management.Helpers;
+using Microsoft.AspNetCore.Authorization;
+
+namespace Restaurant_Management.Controllers
+{
+    [Authorize]
+    [Route("api/[controller]")]
+    [ApiController]
+    public class InvoicesController : ControllerBase
+    {
+        private readonly RestaurantDbContext _context;
+        public InvoicesController(RestaurantDbContext context) => _context = context;
+
+        // 🔹 GET all invoices
+        [AllowAnonymous]
+        [HttpGet]
+        public async Task<ActionResult<IEnumerable<InvoiceDTO>>> GetInvoices()
+        {
+            var invoices = await _context.Invoices
+                .Include(i => i.Order)
+                .Include(i => i.CreatedByUser)
+                .ToListAsync();
+
+            return invoices.Select(i => i.ToDto()).ToList();
+        }
+
+        // 🔹 GET invoice by id
+        [AllowAnonymous]
+        [HttpGet("{id}")]
+        public async Task<ActionResult<InvoiceDTO>> GetInvoice(int id)
+        {
+            var invoice = await _context.Invoices
+                .Include(i => i.Order)
+                .Include(i => i.CreatedByUser)
+                .FirstOrDefaultAsync(i => i.Id == id);
+
+            if (invoice == null)
+                return NotFound(new { message = $"Invoice {id} không tồn tại." });
+
+            return invoice.ToDto();
+        }
+
+        // 🔹 POST: create invoice trực tiếp (ít dùng)
+        [Authorize(Roles = "Admin,Staff")]
+        [HttpPost]
+        public async Task<ActionResult<InvoiceDTO>> PostInvoice(CreateInvoiceDTO dto)
+        {
+            if (!await _context.Orders.AnyAsync(o => o.Id == dto.OrderId))
+                return BadRequest(new { message = $"OrderId {dto.OrderId} không tồn tại." });
+
+            if (!await _context.Users.AnyAsync(u => u.Id == dto.CreatedBy))
+                return BadRequest(new { message = $"User {dto.CreatedBy} không tồn tại." });
+
+            var invoice = new Invoice
+            {
+                OrderId = dto.OrderId,
+                Amount = dto.Amount,
+                Status = dto.Status ?? "Unpaid",
+                PaymentTime = DateTime.UtcNow,
+                CreatedBy = dto.CreatedBy,
+                CreatedAt = DateTime.UtcNow,
+                UpdatedAt = DateTime.UtcNow
+            };
+
+            _context.Invoices.Add(invoice);
+            await _context.SaveChangesAsync();
+
+            return CreatedAtAction(nameof(GetInvoice), new { id = invoice.Id }, invoice.ToDto());
+        }
+
+        // 🔹 POST: tạo invoice từ order khi thanh toán
+        //  [Authorize(Roles = "Admin,Staff")]
+        [AllowAnonymous]
+        [HttpPost("from-order/{orderId}")]
+        public async Task<ActionResult<InvoiceDTO>> CreateInvoiceFromOrder(int orderId, [FromQuery] int userId)
+        {
+            var order = await _context.Orders
+                .Include(o => o.OrderDetails)
+                .FirstOrDefaultAsync(o => o.Id == orderId);
+
+            if (order == null)
+                return NotFound(new { message = $"Order {orderId} không tồn tại." });
+
+            if (!await _context.Users.AnyAsync(u => u.Id == userId))
+                return BadRequest(new { message = $"User {userId} không tồn tại." });
+          
+            bool invoiceExists = await _context.Invoices.AnyAsync(i => i.OrderId == orderId);
+            if (invoiceExists)
+            {
+                return BadRequest(new { message = $"Order {orderId} đã có invoice, không thể tạo thêm." });
+            }
+
+            decimal subTotal = order.OrderDetails.Sum(d => d.Subtotal);
+            decimal tax = subTotal * 0.1m;
+            decimal total = subTotal - order.DiscountAmount + tax;
+
+            order.SubTotal = subTotal;
+            order.TaxAmount = tax;
+            order.TotalAmount = total;
+            order.Status = "Pending Payment";
+            order.UpdatedAt = DateTime.UtcNow;
+
+            var invoice = new Invoice
+            {
+                OrderId = order.Id,
+                Amount = total,
+                Status = "Pending",
+                PaymentTime = DateTime.UtcNow,
+                CreatedBy = userId,
+                CreatedAt = DateTime.UtcNow,
+                UpdatedAt = DateTime.UtcNow
+            };
+
+            _context.Invoices.Add(invoice);
+
+            await _context.SaveChangesAsync();
+
+            return CreatedAtAction(nameof(GetInvoice), new { id = invoice.Id }, invoice.ToDto());
+        }
+
+
+
+
+        // 🔹 PUT: update invoice
+        [Authorize(Roles = "Admin,Staff")]
+        [HttpPut("{id}")]
+        public async Task<IActionResult> PutInvoice(int id, UpdateInvoiceDTO dto)
+        {
+            var invoice = await _context.Invoices.FindAsync(id);
+            if (invoice == null)
+                return NotFound(new { message = $"Invoice {id} không tồn tại." });
+
+            invoice.Amount = dto.Amount;
+            invoice.Status = dto.Status ?? invoice.Status;
+            invoice.UpdatedAt = DateTime.UtcNow;
+
+            _context.Entry(invoice).State = EntityState.Modified;
+
+            try
+            {
+                await _context.SaveChangesAsync();
+                return Ok(new { message = "Cập nhật Invoice thành công." });
+            }
+            catch (DbUpdateConcurrencyException)
+            {
+                if (!await _context.Invoices.AnyAsync(i => i.Id == id))
+                    return NotFound(new { message = $"Invoice {id} không tồn tại." });
+                throw;
+            }
+        }
+
+        //[Authorize(Roles = "Admin,Staff")]
+        /// <summary>
+        /// PUT: Cập nhật trạng thái invoice và tạo promotion usage record
+        /// </summary>
+        [AllowAnonymous]
+        [HttpPut("{id}/status")]
+        public async Task<IActionResult> UpdateInvoiceStatus(int id, [FromBody] UpdateInvoiceDTO dto)
+        {
+            using var transaction = await _context.Database.BeginTransactionAsync();
+            try
+            {              
+                var invoice = await _context.Invoices
+                    .Include(i => i.Order)
+                        .ThenInclude(o => o.OrderTables)
+                            .ThenInclude(ot => ot.Table)
+                    .Include(i => i.Order)
+                        .ThenInclude(o => o.AppliedPromotion)  
+                    .FirstOrDefaultAsync(i => i.Id == id);
+
+                if (invoice == null)
+                    return NotFound(new { message = $"Invoice {id} không tồn tại." });
+
+                var order = invoice.Order;
+                if (order == null)
+                    return BadRequest(new { message = "Invoice không có order liên kết." });
+
+                var oldStatus = invoice.Status;
+
+             
+                invoice.Status = dto.Status ?? invoice.Status;
+                invoice.UpdatedAt = DateTime.UtcNow;
+             
+                if (dto.Status.Equals("Paid", StringComparison.OrdinalIgnoreCase))
+                {
+                    
+                    if (invoice.PaymentTime == null || invoice.PaymentTime == default(DateTime))
+                    {
+                        invoice.PaymentTime = DateTime.UtcNow;
+                    }
+
+                 
+                    order.Status = "Completed";
+                    order.CompletedTime = DateTime.UtcNow;
+                    order.UpdatedAt = DateTime.UtcNow;
+
+                 
+                    if (order.AppliedPromotionId.HasValue)
+                    {
+                        var promotion = order.AppliedPromotion;
+                       
+                        if (promotion == null)
+                        {
+                            promotion = await _context.Promotions.FindAsync(order.AppliedPromotionId.Value);
+                        }
+
+                        if (promotion != null)
+                        {
+                           
+                            var existingUsage = await _context.PromotionUsages
+                                .FirstOrDefaultAsync(pu => pu.InvoiceId == invoice.Id);
+
+                            if (existingUsage == null)
+                            {
+                              
+                                decimal discountApplied = 0;
+                                decimal subTotal = order.SubTotal;
+
+                                if (promotion.DiscountPercent.HasValue)
+                                {
+                                    discountApplied = subTotal * (promotion.DiscountPercent.Value / 100);
+                                    
+                                    if (promotion.MaxDiscountAmount.HasValue &&
+                                        discountApplied > promotion.MaxDiscountAmount.Value)
+                                    {
+                                        discountApplied = promotion.MaxDiscountAmount.Value;
+                                    }
+                                }
+                                else if (promotion.DiscountAmount.HasValue)
+                                {
+                                    discountApplied = promotion.DiscountAmount.Value;
+                                }
+
+                                
+                                var promotionUsage = new PromotionUsage
+                                {
+                                    PromotionId = promotion.Id,
+                                    InvoiceId = invoice.Id,
+                                    CustomerId = null, 
+                                    CustomerPhone = order.CustomerPhone,
+                                    DiscountApplied = discountApplied,
+                                    UsedAt = DateTime.UtcNow
+                                };
+
+                                _context.PromotionUsages.Add(promotionUsage);
+                               
+                                promotion.UsageCount += 1;
+
+                                Console.WriteLine($"✅ Created PromotionUsage: InvoiceId={invoice.Id}, PromotionId={promotion.Id}, Discount={discountApplied}");
+                            }
+                            else
+                            {
+                                Console.WriteLine($"⚠️ PromotionUsage already exists for InvoiceId={invoice.Id}");
+                            }
+                        }
+                    }
+
+                    // 3.4. Giải phóng bàn
+                    var orderTables = order.OrderTables?.ToList();
+                    if (orderTables != null && orderTables.Any())
+                    {
+                        foreach (var ot in orderTables)
+                        {
+                            var table = ot.Table;
+                            if (table != null)
+                            {
+                                table.Status = "Available";
+                                table.QrCodeUrl = null;
+                                table.Capacity = 1;
+                            }
+                        }
+
+                        _context.OrderTables.RemoveRange(orderTables);
+                        Console.WriteLine($"✅ Released {orderTables.Count} tables");
+                    }
+                }
+
+                // 4. Xử lý khi chuyển sang "Cancelled" hoặc "Refunded" (từ Paid)
+                else if ((dto.Status.Equals("Cancelled", StringComparison.OrdinalIgnoreCase) ||
+                          dto.Status.Equals("Refunded", StringComparison.OrdinalIgnoreCase)) &&
+                         oldStatus.Equals("Paid", StringComparison.OrdinalIgnoreCase))
+                {
+                    order.Status = "Cancelled";
+                    order.UpdatedAt = DateTime.UtcNow;
+
+                    // Xóa promotion usage và hoàn lại usage count
+                    var promotionUsage = await _context.PromotionUsages
+                        .FirstOrDefaultAsync(pu => pu.InvoiceId == invoice.Id);
+
+                    if (promotionUsage != null)
+                    {
+                        // Giảm usage count
+                        var promotion = await _context.Promotions.FindAsync(promotionUsage.PromotionId);
+                        if (promotion != null && promotion.UsageCount > 0)
+                        {
+                            promotion.UsageCount -= 1;
+                        }
+
+                        // Xóa promotion usage record
+                        _context.PromotionUsages.Remove(promotionUsage);
+                        Console.WriteLine($"✅ Removed PromotionUsage for InvoiceId={invoice.Id}");
+                    }
+                }
+
+                // 5. Lưu tất cả thay đổi
+                await _context.SaveChangesAsync();
+                await transaction.CommitAsync();
+
+                return Ok(new
+                {
+                    success = true,
+                    message = $"Invoice #{id} đã được cập nhật sang trạng thái '{dto.Status}'.",
+                    data = new
+                    {
+                        invoiceId = invoice.Id,
+                        oldStatus = oldStatus,
+                        newStatus = invoice.Status,
+                        orderId = order.Id,
+                        orderStatus = order.Status,
+                        tablesReleased = order.OrderTables?.Count ?? 0,
+                        promotionApplied = order.AppliedPromotionId.HasValue,
+                        promotionCode = order.AppliedPromotion?.Code
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                await transaction.RollbackAsync();
+                Console.WriteLine($"❌ Error in UpdateInvoiceStatus: {ex.Message}");
+                return StatusCode(500, new
+                {
+                    success = false,
+                    message = "Lỗi cập nhật invoice.",
+                    error = ex.Message,
+                    stackTrace = ex.StackTrace
+                });
+            }
+        }
+        // 🔹 DELETE: delete invoice
+        [Authorize(Roles = "Admin")]
+        [HttpDelete("{id}")]
+        public async Task<IActionResult> DeleteInvoice(int id)
+        {
+            var invoice = await _context.Invoices.FindAsync(id);
+            if (invoice == null)
+                return NotFound(new { message = $"Invoice {id} không tồn tại." });
+
+            _context.Invoices.Remove(invoice);
+            await _context.SaveChangesAsync();
+
+            return Ok(new { message = $"Xóa Invoice {id} thành công." });
+        }
+
+        [AllowAnonymous]
+        [HttpGet("Pay/{orderid}")]
+        public async Task<ActionResult<InvoiceDTO>> GetbyOrder(int orderid)
+        {
+            var invoice = await _context.Invoices
+                .Include(i => i.Order)
+                .Include(i => i.CreatedByUser)
+                .FirstOrDefaultAsync(i => i.OrderId == orderid);
+
+            if (invoice == null)
+                return NotFound(new { message = $"Invoice {orderid} không tồn tại." });
+
+            return invoice.ToDto();
+        }
+    }
+}

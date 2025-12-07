@@ -1,0 +1,33 @@
+﻿{
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft.AspNetCore": "Warning"
+    }
+  },
+  "AllowedHosts": "*",
+  "AllowedOrigins": [    
+    "http://localhost:5173"
+  ],
+  "ConnectionStrings": {
+    "DefaultConnection": "Server=BEECUTE\\SQLEXPRESS;Initial Catalog=RestaurantManagement;Integrated Security=True;Connect Timeout=30;Encrypt=False;Trust Server Certificate=True;Application Intent=ReadWrite;Multi Subnet Failover=False",
+    "Restaurant_ManagementContext": "Server=(localdb)\\mssqllocaldb;Database=Restaurant_ManagementContext-06f952fc-15ba-4165-acc0-9eca93acf9f6;Trusted_Connection=True;MultipleActiveResultSets=true"
+  },
+  "Jwt": {
+    "Issuer": "RestaurantManagementAPI",
+    "Audience": "RestaurantManagementClient"
+  },
+  "EmailSettings": {
+    "Email": "2124801030064@student.tdmu.edu.vn",
+    "Password": "ikzr vpph qsnl cgpg",
+    "Host": "smtp.gmail.com",
+    "DisplayName": "Restaurant Management Support",
+    "Port": 587
+  },  
+  "Sepay": {
+    "ApiKey": "YOUR_SEPAY_API_KEY",
+    "AccountNumber": "0123456789",
+    "AccountName": "RESTAURANT ABC",
+    "BankCode": "MB"
+  }  
+}

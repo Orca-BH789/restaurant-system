@@ -1,0 +1,139 @@
+﻿using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using Restaurant_Management.Data;
+using Restaurant_Management.Models.DTO;
+using Restaurant_Management.Models.Entities;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+
+namespace Restaurant_Management.Controllers
+{
+    [Route("api/[controller]")]
+    [ApiController]
+    public class ReportCachesController : ControllerBase
+    {
+        private readonly RestaurantDbContext _context;
+
+        public ReportCachesController(RestaurantDbContext context)
+        {
+            _context = context;
+        }
+
+        #region CRUD
+
+        // GET: api/ReportCaches
+        [HttpGet]
+        public async Task<ActionResult<IEnumerable<ReportCache>>> GetReportCaches()
+        {
+            return await _context.ReportCaches.ToListAsync();
+        }
+
+        // GET: api/ReportCaches/5
+        [HttpGet("{id}")]
+        public async Task<ActionResult<ReportCache>> GetReportCache(int id)
+        {
+            var reportCache = await _context.ReportCaches.FindAsync(id);
+
+            if (reportCache == null)
+            {
+                return NotFound();
+            }
+
+            return reportCache;
+        }
+
+        // PUT: api/ReportCaches/5
+        // To protect from overposting attacks, see https://go.microsoft.com/fwlink/?linkid=2123754
+        [HttpPut("{id}")]
+        public async Task<IActionResult> PutReportCache(int id, ReportCache reportCache)
+        {
+            if (id != reportCache.Id)
+            {
+                return BadRequest();
+            }
+
+            _context.Entry(reportCache).State = EntityState.Modified;
+
+            try
+            {
+                await _context.SaveChangesAsync();
+            }
+            catch (DbUpdateConcurrencyException)
+            {
+                if (!ReportCacheExists(id))
+                {
+                    return NotFound();
+                }
+                else
+                {
+                    throw;
+                }
+            }
+
+            return NoContent();
+        }
+
+        // DELETE: api/ReportCaches/5
+        [HttpDelete("{id}")]
+        public async Task<IActionResult> DeleteReportCache(int id)
+        {
+            var reportCache = await _context.ReportCaches.FindAsync(id);
+            if (reportCache == null)
+            {
+                return NotFound();
+            }
+
+            _context.ReportCaches.Remove(reportCache);
+            await _context.SaveChangesAsync();
+
+            return NoContent();
+        }
+
+        private bool ReportCacheExists(int id)
+        {
+            return _context.ReportCaches.Any(e => e.Id == id);
+        }
+        #endregion
+
+
+        [HttpGet("{reportType}/{date}")]
+        public async Task<IActionResult> Get(string reportType, DateOnly date)
+        {
+            var cache = await _context.ReportCaches
+                .FirstOrDefaultAsync(r =>
+                    r.ReportType == reportType &&
+                    r.ReportDate == date);
+
+            return Ok(cache);
+        }
+
+        [HttpPost]
+
+        public async Task<IActionResult> Create(CreateReportCacheDTO dto)
+        {
+            var exists = await _context.ReportCaches
+                .FirstOrDefaultAsync(r =>
+                    r.ReportType == dto.ReportType &&
+                    r.ReportDate == dto.ReportDate);
+
+            if (exists != null)
+                _context.ReportCaches.Remove(exists);
+
+            var cache = new ReportCache
+            {
+                ReportType = dto.ReportType,
+                ReportDate = dto.ReportDate,
+                DataJson = dto.DataJson,
+                CreatedAt = DateTime.UtcNow
+            };
+
+            _context.ReportCaches.Add(cache);
+            await _context.SaveChangesAsync();
+
+            return Ok(cache);
+        }
+    }
+}

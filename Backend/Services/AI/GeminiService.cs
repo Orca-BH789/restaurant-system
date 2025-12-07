@@ -1,0 +1,255 @@
+﻿using Restaurant_Management.Models.DTO.AI;
+using Restaurant_Management.Models.DTO.AI.RestaurantManagement.DTOs.AI;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+
+namespace Restaurant_Management.Services.AI
+{
+    public class GeminiService : IGeminiService
+    {
+        private readonly HttpClient _httpClient;
+        private readonly string _apiKey;
+        private readonly string _model;
+        private readonly string _apiUrl;
+        private readonly int _maxTokens;
+        private readonly double _temperature;
+
+        public GeminiService(IConfiguration configuration, HttpClient httpClient)
+        {
+            _httpClient = httpClient;
+            _apiKey = configuration["Gemini:ApiKey"]
+                ?? throw new Exception("Gemini API Key not found in configuration");
+            _model = configuration["Gemini:Model"] ?? "gemini-2.0-flash";
+            _apiUrl = configuration["Gemini:ApiUrl"]
+                ?? "https://generativelanguage.googleapis.com/v1beta/models";
+            _maxTokens = int.Parse(configuration["Gemini:MaxTokens"] ?? "2048");
+            _temperature = double.Parse(configuration["Gemini:Temperature"] ?? "0.7");
+        }
+
+        public async Task<string> GetChatCompletionAsync(
+            string userMessage,
+            List<ChatMessageDto> conversationHistory,
+            AIContextDto context = null)
+        {
+            try
+            {
+                var contents = new List<GeminiContent>();
+
+                // 1. Build System Prompt as first user message
+                var systemPrompt = await GenerateSystemPrompt(context);
+                contents.Add(new GeminiContent
+                {
+                    Role = "user",
+                    Parts = new List<GeminiPart>
+                    {
+                        new GeminiPart { Text = systemPrompt }
+                    }
+                });
+
+                // Gemini expects model response after system prompt
+                contents.Add(new GeminiContent
+                {
+                    Role = "model",
+                    Parts = new List<GeminiPart>
+                    {
+                        new GeminiPart { Text = "Tôi hiểu rồi. Tôi sẽ trợ giúp bạn với vai trò là AI nhà hàng." }
+                    }
+                });
+
+                // 2. Add Conversation History
+                if (conversationHistory != null && conversationHistory.Any())
+                {
+                    foreach (var msg in conversationHistory.TakeLast(10))
+                    {
+                        var role = msg.Role == "user" ? "user" : "model";
+                        contents.Add(new GeminiContent
+                        {
+                            Role = role,
+                            Parts = new List<GeminiPart>
+                            {
+                                new GeminiPart { Text = msg.Content }
+                            }
+                        });
+                    }
+                }
+
+                // 3. Add Current User Message
+                contents.Add(new GeminiContent
+                {
+                    Role = "user",
+                    Parts = new List<GeminiPart>
+                    {
+                        new GeminiPart { Text = userMessage }
+                    }
+                });
+
+                // 4. Build Request
+                var request = new GeminiRequest
+                {
+                    Contents = contents,
+                    GenerationConfig = new GeminiGenerationConfig
+                    {
+                        Temperature = _temperature,
+                        MaxOutputTokens = _maxTokens
+                    }
+                };
+
+                // 5. Call Gemini API
+                var url = $"{_apiUrl}/{_model}:generateContent"; // ✅ Không có ?key=
+
+                var jsonOptions = new JsonSerializerOptions
+                {
+                    PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+                    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+                };
+
+                var jsonContent = JsonSerializer.Serialize(request, jsonOptions);
+                var httpContent = new StringContent(jsonContent, Encoding.UTF8, "application/json");
+
+                // ✅ Tạo HTTP request với header theo cách của Google
+                var httpRequest = new HttpRequestMessage(HttpMethod.Post, url)
+                {
+                    Content = httpContent
+                };
+                httpRequest.Headers.TryAddWithoutValidation("X-goog-api-key", _apiKey);
+
+                var response = await _httpClient.SendAsync(httpRequest);
+                var responseContent = await response.Content.ReadAsStringAsync();
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    throw new Exception($"Gemini API Error: {response.StatusCode} - {responseContent}");
+                }
+
+                // 6. Parse Response
+                var geminiResponse = JsonSerializer.Deserialize<GeminiResponse>(
+                    responseContent,
+                    jsonOptions);
+
+                if (geminiResponse?.Candidates == null || !geminiResponse.Candidates.Any())
+                {
+                    throw new Exception("No response from Gemini API");
+                }
+
+                var firstCandidate = geminiResponse.Candidates[0];
+                if (firstCandidate.Content?.Parts == null || !firstCandidate.Content.Parts.Any())
+                {
+                    throw new Exception("Empty response from Gemini API");
+                }
+
+                return firstCandidate.Content.Parts[0].Text;
+            }
+            catch (Exception ex)
+            {
+                throw new Exception($"Gemini Service Error: {ex.Message}", ex);
+            }
+        }
+
+        public async Task<string> GenerateSystemPrompt(AIContextDto context)
+        {
+            await Task.CompletedTask;
+
+            var prompt = new StringBuilder();
+
+            prompt.AppendLine("# VAI TRÒ");
+            prompt.AppendLine("Bạn là trợ lý AI thông minh của hệ thống nhà hàng Việt Nam.");
+            prompt.AppendLine();
+
+            prompt.AppendLine("# NHIỆM VỤ");
+            prompt.AppendLine("1. Tư vấn món ăn dựa trên sở thích và ngân sách khách hàng");
+            prompt.AppendLine("2. Gợi ý khuyến mãi phù hợp");
+            prompt.AppendLine("3. Hỗ trợ đặt bàn");
+            prompt.AppendLine("4. Cung cấp thống kê cho quản lý (nếu có quyền)");
+            prompt.AppendLine();
+
+            prompt.AppendLine("# QUY TẮC");
+            prompt.AppendLine("- Trả lời bằng tiếng Việt, thân thiện, tự nhiên");
+            prompt.AppendLine("- Chỉ đề xuất món/bàn/khuyến mãi CÓ TRONG DỮ LIỆU bên dưới");
+            prompt.AppendLine("- KHÔNG bịa thêm món ăn không có trong menu");
+            prompt.AppendLine("- Nếu thiếu thông tin, hỏi thêm khách hàng");
+            prompt.AppendLine("- Với analytics, chỉ trả lời nếu user là Admin/Manager");
+            prompt.AppendLine("- Format giá tiền: 85,000 VNĐ (có dấu phẩy)");
+            prompt.AppendLine("- Dùng emoji phù hợp: 🍽️ 🎁 📊");
+            prompt.AppendLine();
+
+            if (context != null)
+            {
+                // Menu Items
+                if (context.AvailableMenuItems != null && context.AvailableMenuItems.Any())
+                {
+                    prompt.AppendLine("# MENU HIỆN CÓ");
+                    var groupedMenu = context.AvailableMenuItems
+                        .GroupBy(m => m.CategoryName ?? "Khác")
+                        .Take(5);
+                    foreach (var group in groupedMenu)
+                    {
+                        prompt.AppendLine($"\n## {group.Key}");
+                        foreach (var item in group.Take(10)) // Max 10 món/category
+                        {
+                            prompt.AppendLine($"- **{item.Name}**: {item.Price:N0} VNĐ");
+                            if (!string.IsNullOrEmpty(item.Description))
+                                prompt.AppendLine($"  {item.Description}");
+                            if (item.IsVegetarian)
+                                prompt.AppendLine("  [Món chay] 🌱");
+                        }
+                    }
+                    prompt.AppendLine();
+                }
+
+                // Promotions
+                if (context.ActivePromotions != null && context.ActivePromotions.Any())
+                {
+                    prompt.AppendLine("# KHUYẾN MÃI ĐANG ÁP DỤNG");
+                    foreach (var promo in context.ActivePromotions.Take(5))
+                    {
+                        prompt.AppendLine($"- **{promo.Code}**: {promo.Description}");
+                        var discountText = promo.DiscountType == "Percentage"
+                            ? $"{promo.DiscountValue}%"
+                            : $"{promo.DiscountValue:N0} VNĐ";
+                        prompt.AppendLine($"  Giảm: {discountText}");
+                        prompt.AppendLine($"  Áp dụng từ {promo.StartDate:dd/MM/yyyy} đến {promo.EndDate:dd/MM/yyyy}");
+                    }
+                    prompt.AppendLine();
+                }
+
+                // Available Tables
+                if (context.AvailableTables != null && context.AvailableTables.Any())
+                {
+                    prompt.AppendLine("# BÀN TRỐNG");
+                    foreach (var table in context.AvailableTables.Take(10))
+                    {
+                        prompt.AppendLine($"- Bàn {table.TableNumber}: {table.Capacity} chỗ");
+                        if (!string.IsNullOrEmpty(table.Location))
+                            prompt.AppendLine($"  Vị trí: {table.Location}");
+                    }
+                    prompt.AppendLine();
+                }
+
+                // User Preferences
+                if (context.UserPreferences != null && context.UserPreferences.Any())
+                {
+                    prompt.AppendLine("# SỞ THÍCH KHÁCH HÀNG");
+                    foreach (var pref in context.UserPreferences)
+                    {
+                        prompt.AppendLine($"- {pref.Key}: {pref.Value}");
+                    }
+                    prompt.AppendLine();
+                }
+
+                // Analytics
+                if (context.RecentAnalytics != null)
+                {
+                    prompt.AppendLine("# THỐNG KÊ GẦN ĐÂY");
+                    prompt.AppendLine(context.RecentAnalytics.Summary);
+                    prompt.AppendLine();
+                }
+            }
+
+            prompt.AppendLine("# LƯU Ý");
+            prompt.AppendLine("Hãy tư vấn dựa CHÍNH XÁC trên dữ liệu trên. Không tự bịa thêm món ăn hoặc thông tin.");
+
+            return prompt.ToString();
+        }
+    }
+}

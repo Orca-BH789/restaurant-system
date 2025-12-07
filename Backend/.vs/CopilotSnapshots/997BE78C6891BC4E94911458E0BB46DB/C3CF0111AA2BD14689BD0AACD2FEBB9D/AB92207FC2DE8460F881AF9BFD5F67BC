@@ -1,0 +1,195 @@
+﻿using Microsoft.EntityFrameworkCore;
+using Restaurant_Management.Data;
+using System.Security.Claims;
+
+namespace Restaurant_Management.Services.AI
+{
+    /// <summary>
+    /// Service cung c?p quy?n truy c?p toàn di?n cho ChatBot Assistant
+    /// Cho phép ChatBot ??c t?t c? d? li?u kinh doanh mà không c?n ki?m tra quy?n
+    /// </summary>
+    public interface IChatBotDataAccessService
+    {
+        /// <summary>
+        /// ChatBot có th? truy c?p t?t c? ??n hàng (không c?n filter by staff/user)
+        /// </summary>
+        IQueryable<Models.Entities.Order> GetAllOrdersForAnalytics();
+
+        /// <summary>
+        /// ChatBot có th? truy c?p t?t c? khuy?n mãi
+        /// </summary>
+        IQueryable<Models.Entities.Promotion> GetAllPromotions();
+
+        /// <summary>
+        /// ChatBot có th? truy c?p t?t c? menu items
+        /// </summary>
+        IQueryable<Models.Entities.MenuItem> GetAllMenuItems();
+
+        /// <summary>
+        /// ChatBot có th? truy c?p t?t c? bàn
+        /// </summary>
+        IQueryable<Models.Entities.Table> GetAllTables();
+
+        /// <summary>
+        /// ChatBot có th? truy c?p t?t c? hóa ??n
+        /// </summary>
+        IQueryable<Models.Entities.Invoice> GetAllInvoices();
+
+        /// <summary>
+        /// ChatBot có th? truy c?p l?ch s? giao d?ch
+        /// </summary>
+        IQueryable<Models.Entities.HistoryLog> GetHistoryLogs();
+
+        /// <summary>
+        /// ChatBot có th? xem th?ng kê t?ng quát
+        /// </summary>
+        Task<Dictionary<string, object>> GetBusinessSummaryAsync();
+    }
+
+    public class ChatBotDataAccessService : IChatBotDataAccessService
+    {
+        private readonly RestaurantDbContext _context;
+        private readonly IChatBotAuthorizationHelper _authHelper;
+
+        public ChatBotDataAccessService(
+            RestaurantDbContext context,
+            IChatBotAuthorizationHelper authHelper)
+        {
+            _context = context;
+            _authHelper = authHelper;
+        }
+
+        /// <summary>
+        /// L?y t?t c? ??n hàng cho phân tích (không filter by user/staff)
+        /// </summary>
+        public IQueryable<Models.Entities.Order> GetAllOrdersForAnalytics()
+        {
+            return _context.Orders
+                .Include(o => o.Staff)
+                .Include(o => o.OrderDetails)
+                    .ThenInclude(od => od.MenuItem)
+                .Include(o => o.OrderTables)
+                    .ThenInclude(ot => ot.Table)
+                .Include(o => o.Invoices)
+                .AsNoTracking();
+        }
+
+        /// <summary>
+        /// L?y t?t c? khuy?n mãi
+        /// </summary>
+        public IQueryable<Models.Entities.Promotion> GetAllPromotions()
+        {
+            return _context.Promotions
+                .Include(p => p.PromotionUsages)
+                .AsNoTracking();
+        }
+
+        /// <summary>
+        /// L?y t?t c? menu items
+        /// </summary>
+        public IQueryable<Models.Entities.MenuItem> GetAllMenuItems()
+        {
+            return _context.MenuItems
+                .Include(m => m.Category)
+                .AsNoTracking();
+        }
+
+        /// <summary>
+        /// L?y t?t c? bàn
+        /// </summary>
+        public IQueryable<Models.Entities.Table> GetAllTables()
+        {
+            return _context.Tables.AsNoTracking();
+        }
+
+        /// <summary>
+        /// L?y t?t c? hóa ??n
+        /// </summary>
+        public IQueryable<Models.Entities.Invoice> GetAllInvoices()
+        {
+            return _context.Invoices
+                .Include(i => i.Order)
+                    .ThenInclude(o => o.Staff)
+                .AsNoTracking();
+        }
+
+        /// <summary>
+        /// L?y l?ch s? giao d?ch
+        /// </summary>
+        public IQueryable<Models.Entities.HistoryLog> GetHistoryLogs()
+        {
+            return _context.HistoryLogs.AsNoTracking();
+        }
+
+        /// <summary>
+        /// L?y th?ng kê t?ng quát cho ChatBot dashboard
+        /// </summary>
+        public async Task<Dictionary<string, object>> GetBusinessSummaryAsync()
+        {
+            try
+            {
+                var today = DateTime.Today;
+                var thisMonth = new DateTime(today.Year, today.Month, 1);
+
+                // Doanh thu hôm nay
+                var todayRevenue = await _context.Invoices
+                    .Where(i => i.CreatedAt.Date == today && i.Status == "Paid")
+                    .SumAsync(i => (decimal?)i.Amount) ?? 0;
+
+                // Doanh thu tháng này
+                var monthRevenue = await _context.Invoices
+                    .Where(i => i.CreatedAt >= thisMonth && i.Status == "Paid")
+                    .SumAsync(i => (decimal?)i.Amount) ?? 0;
+
+                // T?ng ??n hôm nay
+                var todayOrders = await _context.Orders
+                    .Where(o => o.OrderTime.Date == today)
+                    .CountAsync();
+
+                // Top 5 món bán ch?y nh?t
+                var topItems = await _context.OrderDetails
+                    .GroupBy(od => od.MenuItemId)
+                    .Select(g => new
+                    {
+                        MenuItemId = g.Key,
+                        TotalQuantity = g.Sum(od => od.Quantity),
+                        ItemName = g.FirstOrDefault()!.MenuItem!.Name
+                    })
+                    .OrderByDescending(x => x.TotalQuantity)
+                    .Take(5)
+                    .ToListAsync();
+
+                // T?ng khuy?n mãi ?ã dùng hôm nay
+                var promotionsToday = await _context.PromotionUsages
+                    .Where(pu => pu.UsedAt.Date == today)
+                    .CountAsync();
+
+                // Tr?ng thái bàn
+                var tableStats = await _context.Tables
+                    .GroupBy(t => t.Status)
+                    .Select(g => new { Status = g.Key, Count = g.Count() })
+                    .ToListAsync();
+
+                return new Dictionary<string, object>
+                {
+                    { "timestamp", DateTime.UtcNow },
+                    { "todayRevenue", todayRevenue },
+                    { "monthRevenue", monthRevenue },
+                    { "todayOrderCount", todayOrders },
+                    { "topSellingItems", topItems },
+                    { "promotionUsageToday", promotionsToday },
+                    { "tableStatus", tableStats },
+                    { "accessLevel", "ChatBot Full Analytics Access" }
+                };
+            }
+            catch (Exception ex)
+            {
+                return new Dictionary<string, object>
+                {
+                    { "error", ex.Message },
+                    { "timestamp", DateTime.UtcNow }
+                };
+            }
+        }
+    }
+}

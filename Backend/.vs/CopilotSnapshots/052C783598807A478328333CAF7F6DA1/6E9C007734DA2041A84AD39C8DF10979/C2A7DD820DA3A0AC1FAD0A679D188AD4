@@ -1,0 +1,248 @@
+﻿using AspNetCoreRateLimit;
+using DotNetEnv;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
+using Microsoft.IdentityModel.Tokens;
+using Microsoft.OpenApi.Models;
+using Restaurant_Management.Data;
+using Restaurant_Management.Middleware;
+using Restaurant_Management.Services;
+using Restaurant_Management.Services.AI;
+using Restaurant_Management.Services.Email;
+using Restaurant_Management.Services.Payment;
+using Restaurant_Management.Services.Promotion;
+using Restaurant_Management.Services.Reservation;
+using RestaurantManagement.Services;
+using System.Security.Claims;
+using System.Text;
+
+var builder = WebApplication.CreateBuilder(args);
+Env.Load();
+
+// Improved configuration
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AllowLocalhost5173", policy =>
+    {
+        var allowedOrigins = builder.Configuration
+            .GetSection("AllowedOrigins")
+            .Get<string[]>() ?? new[] { "http://localhost:5173" };
+
+        policy.WithOrigins(allowedOrigins)
+              .WithHeaders("Content-Type", "Authorization", "X-CSRF-TOKEN")
+              .WithMethods("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS") // ✅ Thêm OPTIONS
+              .AllowCredentials()
+              .WithExposedHeaders("Token-Expired")
+              .SetPreflightMaxAge(TimeSpan.FromMinutes(10)); // ✅ Cache preflight
+    });
+});
+
+// Controllers + Swagger
+builder.Services.AddControllers();
+builder.Services.AddAntiforgery(options =>
+{
+    options.HeaderName = "X-CSRF-TOKEN";
+    options.Cookie.Name = "XSRF-TOKEN";
+    options.Cookie.HttpOnly = false;
+    options.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest; 
+    options.Cookie.SameSite = SameSiteMode.None;
+});
+
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen(options =>
+{
+    options.SwaggerDoc("v1", new OpenApiInfo
+    {
+        Title = "Restaurant Management API",
+        Version = "v1",
+        Description = "API cho hệ thống quản lý nhà hàng"
+    });
+
+    options.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
+    {
+        Name = "Authorization",
+        Type = SecuritySchemeType.Http,
+        Scheme = "bearer",
+        BearerFormat = "JWT",
+        In = ParameterLocation.Header,
+        Description = "Nhập token JWT vào đây. VD: Bearer ..."
+    });
+
+    options.AddSecurityRequirement(new OpenApiSecurityRequirement
+    {
+        {
+            new OpenApiSecurityScheme
+            {
+                Reference = new OpenApiReference
+                {
+                    Type = ReferenceType.SecurityScheme,
+                    Id = "Bearer"
+                }
+            },
+            new string[] {}
+        }
+    });
+});
+
+// DB Context
+builder.Services.AddDbContext<RestaurantDbContext>(options =>
+    options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
+
+// Custom services
+builder.Services.AddScoped<FileService>();
+builder.Services.AddScoped<IEmailService, EmailService>();
+builder.Services.AddScoped<IReservationService, ReservationService>();
+builder.Services.AddScoped<IPromotionService, PromotionService>();
+builder.Services.AddScoped<IGeminiService, GeminiService>();
+builder.Services.AddScoped<IAIAnalyticsService, AIAnalyticsService>();
+builder.Services.AddScoped<IAIChatService, AIChatService>();
+builder.Services.AddScoped<IChatBotAuthorizationHelper, ChatBotAuthorizationHelper>();
+
+builder.Services.AddHttpClient();
+builder.Services.AddScoped<IPaymentService, PaymentService>();
+builder.Services.AddHttpClient<IGeminiService, GeminiService>();
+builder.Services.AddMemoryCache();
+
+// JWT Authentication
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidateAudience = true,
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            ValidIssuer = builder.Configuration["Jwt:Issuer"],
+            ValidAudience = builder.Configuration["Jwt:Audience"],
+            IssuerSigningKey = new SymmetricSecurityKey(
+                Encoding.UTF8.GetBytes(
+                    Environment.GetEnvironmentVariable("JWT_KEY") ??
+                    builder.Configuration["JWT_KEY"] ?? ""
+                )
+            ),
+            ClockSkew = TimeSpan.Zero
+        };
+
+        options.Events = new JwtBearerEvents
+        {
+            OnMessageReceived = context =>
+            {
+                if (context.Request.Cookies.ContainsKey("accessToken"))
+                {
+                    context.Token = context.Request.Cookies["accessToken"];
+                }
+                else if (context.Request.Headers.ContainsKey("Authorization"))
+                {
+                    var authHeader = context.Request.Headers["Authorization"].ToString();
+                    if (authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+                    {
+                        context.Token = authHeader.Substring(7);
+                    }
+                }
+                return Task.CompletedTask;
+            },
+
+            OnAuthenticationFailed = context =>
+            {
+                if (context.Exception.GetType() == typeof(SecurityTokenExpiredException))
+                {
+                    context.Response.Headers.Add("Token-Expired", "true");
+                }
+                return Task.CompletedTask;
+            },
+
+            OnChallenge = context =>
+            {
+                context.HandleResponse();
+                context.Response.StatusCode = 401;
+                context.Response.ContentType = "application/json";
+
+                var result = System.Text.Json.JsonSerializer.Serialize(new
+                {
+                    message = "Token không hợp lệ hoặc đã hết hạn"
+                });
+
+                return context.Response.WriteAsync(result);
+            }
+        };
+    });
+
+// Rate Limiting
+builder.Services.Configure<IpRateLimitOptions>(options =>
+{
+    options.EnableEndpointRateLimiting = true;
+    options.StackBlockedRequests = false;
+    options.GeneralRules = new List<RateLimitRule>
+    {
+        new RateLimitRule
+        {
+            Endpoint = "POST:/api/auth/login",
+            Period = "1m",
+            Limit = 5
+        },
+        new RateLimitRule
+        {
+            Endpoint = "POST:/api/auth/forgot-password",
+            Period = "5m",
+            Limit = 3
+        },
+        new RateLimitRule
+        {
+            Endpoint = "POST:/api/auth/refresh-token",
+            Period = "1m",
+            Limit = 10
+        },
+        new RateLimitRule
+        {
+            Endpoint = "POST:/api/auth/revoke-all-tokens",
+            Period = "5m",
+            Limit = 5
+        }
+    };
+});
+
+builder.Services.AddSingleton<IIpPolicyStore, MemoryCacheIpPolicyStore>();
+builder.Services.AddSingleton<IRateLimitCounterStore, MemoryCacheRateLimitCounterStore>();
+builder.Services.AddSingleton<IRateLimitConfiguration, RateLimitConfiguration>();
+builder.Services.AddSingleton<IProcessingStrategy, AsyncKeyLockProcessingStrategy>();
+
+var app = builder.Build();
+
+//  Add PathBase for Cloudflare Tunnel
+var pathBase = builder.Configuration["PathBase"];
+if (!string.IsNullOrEmpty(pathBase))
+{
+    app.UsePathBase(pathBase);
+    Console.WriteLine($"✅ Using PathBase: {pathBase}");
+}
+
+// ✅ Development tools
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
+
+// ✅ Middleware order is CRITICAL
+app.UseSecurityHeaders();
+
+// ✅ HTTPS Redirection - comment out for local testing with HTTP
+// app.UseHttpsRedirection();
+
+
+
+app.UseCors("AllowLocalhost5173");
+app.UseStaticFiles();
+app.UseAuthentication();
+app.UseIpRateLimiting();
+app.UseMiddleware<TableTokenMiddleware>();
+app.UseAuthorization();
+
+app.MapControllers();
+
+Console.WriteLine($"Environment: {app.Environment.EnvironmentName}");
+Console.WriteLine($"CORS Origins: {string.Join(", ", builder.Configuration.GetSection("AllowedOrigins").Get<string[]>() ?? new[] { "none" })}");
+
+app.Run();

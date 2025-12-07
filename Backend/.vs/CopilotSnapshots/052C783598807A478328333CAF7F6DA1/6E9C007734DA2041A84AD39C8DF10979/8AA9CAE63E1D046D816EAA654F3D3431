@@ -1,0 +1,131 @@
+﻿using Microsoft.AspNetCore.Mvc;
+using Restaurant_Management.Models.DTO.AI.RestaurantManagement.DTOs.AI;
+using Restaurant_Management.Services.AI;
+using System.Security.Claims;
+
+namespace Restaurant_Management.Controllers
+{
+    [ApiController]
+    [Route("api/[controller]")]
+    public class AIChatController : ControllerBase
+    {
+        private readonly IAIChatService _chatService;
+
+        public AIChatController(IAIChatService chatService)
+        {
+            _chatService = chatService;
+        }
+
+        /// <summary>
+        /// Gửi tin nhắn cho AI
+        /// </summary>
+        [HttpPost("message")]
+        public async Task<ActionResult<SendMessageResponse>> SendMessage([FromBody] SendMessageRequest request)
+        {
+            try
+            {
+                var userId = GetCurrentUserId();
+                var response = await _chatService.SendMessageAsync(request, userId);
+                return Ok(response);
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                return Unauthorized(new { message = ex.Message });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        /// <summary>
+        /// Lấy chi tiết conversation
+        /// </summary>
+        [HttpGet("conversation/{sessionId}")]
+        public async Task<ActionResult<ConversationDto>> GetConversation(string sessionId)
+        {
+            try
+            {
+                var conversation = await _chatService.GetConversationAsync(sessionId);
+                if (conversation == null)
+                    return NotFound(new { message = "Conversation not found" });
+
+                return Ok(conversation);
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        /// <summary>
+        /// Lấy lịch sử conversations của user
+        /// </summary>
+        [HttpGet("history")]
+        public async Task<ActionResult<ConversationHistoryResponse>> GetHistory(
+            [FromQuery] int page = 1,
+            [FromQuery] int pageSize = 10)
+        {
+            try
+            {
+                var userId = GetCurrentUserId();
+                var history = await _chatService.GetUserConversationsAsync(userId, page, pageSize);
+                return Ok(history);
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        /// <summary>
+        /// Kết thúc conversation
+        /// </summary>
+        [HttpPost("conversation/{sessionId}/end")]
+        public async Task<ActionResult> EndConversation(string sessionId)
+        {
+            try
+            {
+                var result = await _chatService.EndConversationAsync(sessionId);
+                if (!result)
+                    return NotFound(new { message = "Conversation not found" });
+
+                return Ok(new { message = "Conversation ended successfully" });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        /// <summary>
+        /// Test endpoint - Gợi ý menu
+        /// </summary>
+        [HttpPost("test/menu-suggestions")]
+        public async Task<ActionResult<List<MenuSuggestionDto>>> TestMenuSuggestions(
+            [FromBody] string userMessage)
+        {
+            try
+            {
+                var userId = GetCurrentUserId();
+
+                // Create temp conversation for testing
+                var tempRequest = new SendMessageRequest { Message = userMessage };
+                var response = await _chatService.SendMessageAsync(tempRequest, userId);
+
+                return Ok(response.Data);
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        // Helper method
+        private int? GetCurrentUserId()
+        {
+            var userIdClaim = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+            return int.TryParse(userIdClaim, out var userId) ? userId : null;
+        }
+    }
+}

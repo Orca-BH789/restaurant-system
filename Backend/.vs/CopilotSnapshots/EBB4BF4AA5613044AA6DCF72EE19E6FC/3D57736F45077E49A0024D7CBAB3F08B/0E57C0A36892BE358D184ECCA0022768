@@ -1,0 +1,1171 @@
+﻿using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.Tokens;
+using Restaurant_Management.Data;
+using Restaurant_Management.Models.DTO;
+using Restaurant_Management.Models.Entities;
+using Restaurant_Management.Services;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using System.Text;
+
+namespace Restaurant_Management.Controllers
+{
+    [Authorize]
+    [Route("api/[controller]")]
+    [ApiController]
+    public class OrdersController : ControllerBase
+    {
+        private readonly RestaurantDbContext _context;
+        private readonly IConfiguration _configuration;
+        private readonly string _jwtkey;
+        private readonly IDataAccessControlService _dataAccessControl;
+
+        public OrdersController(
+            RestaurantDbContext context,
+            IConfiguration configuration,
+            IDataAccessControlService dataAccessControl)
+        {
+            _context = context;
+            _configuration = configuration;
+            _jwtkey = Environment.GetEnvironmentVariable("JWT_KEY") ?? _configuration["Jwt:Key"] ?? "";
+            _dataAccessControl = dataAccessControl;
+        }
+
+        /// <summary>
+        /// GET: Lấy danh sách orders với filter
+        /// </summary>
+        [Authorize(Roles = "Admin,Staff")]
+        [HttpGet]
+        public async Task<ActionResult<IEnumerable<OrderDTO>>> GetOrders(
+            [FromQuery] string? status = null,
+            [FromQuery] DateTime? fromDate = null,
+            [FromQuery] DateTime? toDate = null,
+            [FromQuery] int? staffId = null)
+        {
+            var query = _context.Orders
+                .Include(o => o.Staff)
+                .Include(o => o.Customer)
+                .Include(o => o.OrderDetails).ThenInclude(d => d.MenuItem)
+                .Include(o => o.Invoices)
+                .Include(o => o.OrderTables).ThenInclude(ot => ot.Table)
+                .AsQueryable();
+
+            if (!string.IsNullOrEmpty(status))
+                query = query.Where(o => o.Status == status);
+            if (fromDate.HasValue)
+                query = query.Where(o => o.OrderTime >= fromDate.Value);
+            if (toDate.HasValue)
+                query = query.Where(o => o.OrderTime <= toDate.Value);
+            if (staffId.HasValue)
+                query = query.Where(o => o.StaffId == staffId.Value);
+
+            var orders = await query.OrderByDescending(o => o.OrderTime).ToListAsync();
+            return Ok(orders.Select(MapToDto).ToList());
+        }
+
+        /// <summary>
+        /// GET: Lấy order theo ID
+        /// </summary>
+        [Authorize(Roles = "Admin,Staff")]
+        [HttpGet("{id}")]
+        public async Task<ActionResult<OrderDTO>> GetOrder(int id)
+        {
+            var order = await _context.Orders
+                .Include(o => o.Staff)
+                .Include(o => o.Customer)
+                .Include(o => o.OrderDetails).ThenInclude(d => d.MenuItem)
+                .Include(o => o.Invoices)
+                .Include(o => o.OrderTables).ThenInclude(ot => ot.Table)
+                .FirstOrDefaultAsync(o => o.Id == id);
+
+            if (order == null)
+                return NotFound(new { message = $"Order {id} không tồn tại." });
+
+            return Ok(MapToDto(order));
+        }
+
+        /// <summary>
+        /// POST: Tạo order mới (Staff)
+        /// </summary>
+        [Authorize(Roles = "Admin,Staff")]
+        [HttpPost]
+        public async Task<ActionResult<OrderDTO>> PostOrder([FromBody] CreateOrderDto dto)
+        {
+            // ✅ Validate quyền
+            _dataAccessControl.ValidateAction(User, "Order", "Create");
+
+            using var transaction = await _context.Database.BeginTransactionAsync();
+            try
+            {
+                if (dto.TableIds.Any())
+                {
+                    var tables = await _context.Tables
+                        .Where(t => dto.TableIds.Contains(t.Id))
+                        .ToListAsync();
+
+                    if (tables.Count != dto.TableIds.Count)
+                        return BadRequest(new { message = "Một hoặc nhiều bàn không tồn tại." });
+
+                    var occupiedTables = tables.Where(t => t.Status == "Occupied").ToList();
+                    if (occupiedTables.Any())
+                        return BadRequest(new
+                        {
+                            message = "Một hoặc nhiều bàn đã có người.",
+                            occupiedTables = occupiedTables.Select(t => t.TableNumber)
+                        });
+                }
+
+                // ✅ KIỂM TRA TRÙNG LẶP MÓN (Cùng MenuItemId + cùng Note + cùng Quantity = Trùng)
+                if (dto.Items.Any())
+                {
+                    var duplicateItems = dto.Items
+                        .GroupBy(i => new { i.MenuItemId, i.Note })
+                        .Where(g => g.Count() > 1)
+                        .Select(g => new
+                        {
+                            menuItemId = g.Key.MenuItemId,
+                            note = g.Key.Note,
+                            count = g.Count(),
+                            quantities = g.Select(x => x.Quantity).ToList()
+                        })
+                        .ToList();
+
+                    if (duplicateItems.Any())
+                    {
+                        return BadRequest(new
+                        {
+                            message = "Phát hiện món ăn trùng lặp trong đơn hàng (cùng món + cùng ghi chú)",
+                            duplicates = duplicateItems.Select(d => new
+                            {
+                                menuItemId = d.menuItemId,
+                                note = string.IsNullOrEmpty(d.note) ? "(không có ghi chú)" : d.note,
+                                message = $"Món ID {d.menuItemId} (ghi chú: '{(string.IsNullOrEmpty(d.note) ? "không có" : d.note)}') xuất hiện {d.count} lần"
+                            })
+                        });
+                    }
+                }
+
+                decimal subTotal = 0;
+                var orderDetails = new List<OrderDetail>();
+
+                if (dto.Items.Any())
+                {
+                    var menuItemIds = dto.Items.Select(i => i.MenuItemId).Distinct().ToList();
+                    var menuItems = await _context.MenuItems
+                        .Where(m => menuItemIds.Contains(m.Id) && m.IsAvailable)
+                        .ToDictionaryAsync(m => m.Id);
+
+                    foreach (var item in dto.Items)
+                    {
+                        if (!menuItems.ContainsKey(item.MenuItemId))
+                            return BadRequest(new { message = $"Món {item.MenuItemId} không khả dụng." });
+
+                        var menuItem = menuItems[item.MenuItemId];
+                        var detail = new OrderDetail
+                        {
+                            MenuItemId = item.MenuItemId,
+                            Quantity = item.Quantity,
+                            UnitPrice = menuItem.Price,
+                            Note = item.Note,
+                            Status = "Pending"
+                        };
+                        orderDetails.Add(detail);
+                        subTotal += menuItem.Price * item.Quantity;
+                    }
+                }
+
+                var discountAmount = subTotal * (dto.Discount / 100);
+                var taxAmount = (subTotal - discountAmount) * 0.1m;
+                var totalAmount = subTotal - discountAmount + taxAmount;
+
+                // Link hoặc tạo Customer
+                int? customerId = null;
+                if (!string.IsNullOrEmpty(dto.CustomerPhone))
+                {
+                    var customer = await _context.Customer
+                        .FirstOrDefaultAsync(c => c.Phone == dto.CustomerPhone);
+
+                    if (customer != null)
+                    {
+                        customerId = customer.Id;
+                    }
+                    else if (!string.IsNullOrEmpty(dto.CustomerName))
+                    {
+                        // Tạo Customer mới
+                        var newCustomer = new Customer
+                        {
+                            FullName = dto.CustomerName,
+                            Phone = dto.CustomerPhone,
+                            CreatedAt = DateTime.UtcNow,
+                            UpdatedAt = DateTime.UtcNow
+                        };
+                        _context.Customer.Add(newCustomer);
+                        await _context.SaveChangesAsync();
+                        customerId = newCustomer.Id;
+                    }
+                }
+
+                var order = new Order
+                {
+                    OrderNumber = $"ORD-{DateTime.Now:yyyyMMddHHmmss}",
+                    StaffId = dto.StaffId,
+                    CustomerId = customerId,
+                    NumberOfGuests = dto.NumberOfGuests,
+                    OrderType = dto.OrderType,
+                    OrderTime = DateTime.UtcNow,
+                    CreatedAt = DateTime.UtcNow,
+                    UpdatedAt = DateTime.UtcNow,
+                    Status = "Ordered",
+                    SubTotal = subTotal,
+                    DiscountAmount = discountAmount,
+                    TaxAmount = taxAmount,
+                    TotalAmount = totalAmount,
+                    OrderDetails = orderDetails
+                };
+
+                _context.Orders.Add(order);
+                await _context.SaveChangesAsync();
+
+                if (dto.TableIds.Any())
+                {
+                    foreach (var tableId in dto.TableIds)
+                    {
+                        _context.OrderTables.Add(new OrderTable
+                        {
+                            OrderId = order.Id,
+                            TableId = tableId
+                        });
+
+                        var table = await _context.Tables.FindAsync(tableId);
+                        if (table != null) table.Status = "Occupied";
+                    }
+                    await _context.SaveChangesAsync();
+                }
+
+                await transaction.CommitAsync();
+
+                var createdOrder = await _context.Orders
+                    .Include(o => o.Staff)
+                    .Include(o => o.Customer)
+                    .Include(o => o.OrderDetails).ThenInclude(d => d.MenuItem)
+                    .Include(o => o.OrderTables).ThenInclude(ot => ot.Table)
+                    .FirstAsync(o => o.Id == order.Id);
+
+                return CreatedAtAction(nameof(GetOrder), new { id = order.Id }, MapToDto(createdOrder));
+            }
+            catch (Exception ex)
+            {
+                await transaction.RollbackAsync();
+                return StatusCode(500, new { message = "Lỗi tạo đơn hàng.", error = ex.Message });
+            }
+        }
+
+        /// <summary>
+        /// PUT: Cập nhật thông tin order (Staff)
+        /// </summary>
+        [Authorize(Roles = "Admin,Staff")]
+        [HttpPut("{id}")]
+        public async Task<IActionResult> PutOrder(int id, UpdateOrderDTO dto)
+        {
+            // ✅ Validate quyền
+            _dataAccessControl.ValidateAction(User, "Order", "Update");
+
+            var order = await _context.Orders.FindAsync(id);
+            if (order == null)
+                return NotFound(new { message = $"Order {id} không tồn tại." });
+
+            if (order.Status != "Ordered")
+                return BadRequest(new { message = "Chỉ có thể sửa đơn đang ở trạng thái 'Ordered'." });
+
+            // Cập nhật Customer nếu có phone mới
+            if (!string.IsNullOrEmpty(dto.CustomerPhone))
+            {
+                var customer = await _context.Customer
+                    .FirstOrDefaultAsync(c => c.Phone == dto.CustomerPhone);
+
+                if (customer != null)
+                {
+                    order.CustomerId = customer.Id;
+                }
+                else if (!string.IsNullOrEmpty(dto.CustomerName))
+                {
+                    var newCustomer = new Customer
+                    {
+                        FullName = dto.CustomerName,
+                        Phone = dto.CustomerPhone,
+                        CreatedAt = DateTime.UtcNow,
+                        UpdatedAt = DateTime.UtcNow
+                    };
+                    _context.Customer.Add(newCustomer);
+                    await _context.SaveChangesAsync();
+                    order.CustomerId = newCustomer.Id;
+                }
+            }
+
+            order.NumberOfGuests = dto.NumberOfGuests ?? order.NumberOfGuests;
+            order.OrderType = dto.OrderType ?? order.OrderType;
+            order.UpdatedAt = DateTime.UtcNow;
+
+            await _context.SaveChangesAsync();
+            return Ok(new { message = "Cập nhật Order thành công." });
+        }
+
+        /// <summary>
+        /// DELETE: Xóa order (Admin only)
+        /// </summary>
+        [Authorize(Roles = "Admin")]
+        [HttpDelete("{id}")]
+        public async Task<IActionResult> DeleteOrder(int id)
+        {
+            // ✅ Validate quyền
+            _dataAccessControl.ValidateAction(User, "Order", "Delete");
+
+            using var transaction = await _context.Database.BeginTransactionAsync();
+            try
+            {
+                var order = await _context.Orders
+                    .Include(o => o.OrderTables)
+                    .FirstOrDefaultAsync(o => o.Id == id);
+
+                if (order == null)
+                    return NotFound(new { message = $"Order {id} không tồn tại." });
+
+                if (order.Status == "Completed" || order.Status == "Paid")
+                    return BadRequest(new { message = "Không thể xóa đơn đã hoàn tất hoặc đã thanh toán." });
+
+                foreach (var ot in order.OrderTables)
+                {
+                    var table = await _context.Tables.FindAsync(ot.TableId);
+                    if (table != null) table.Status = "Available";
+                }
+
+                _context.Orders.Remove(order);
+                await _context.SaveChangesAsync();
+                await transaction.CommitAsync();
+
+                return Ok(new { message = $"Xóa Order {id} thành công." });
+            }
+            catch (Exception ex)
+            {
+                await transaction.RollbackAsync();
+                return StatusCode(500, new { message = "Lỗi xóa đơn hàng.", error = ex.Message });
+            }
+        }
+
+        [AllowAnonymous]
+        [HttpGet("Tables/{tableId}/current")]
+        public async Task<ActionResult<OrderDTO>> GetCurrentOrderByTable(int tableId)
+        {
+            try
+            {
+                var table = await _context.Tables.FindAsync(tableId);
+                if (table == null)
+                    return NotFound(new { message = $"Bàn {tableId} không tồn tại." });
+
+
+                var currentOrder = await _context.OrderTables
+                    .Include(ot => ot.Order)
+                        .ThenInclude(o => o.Staff)
+                    .Include(ot => ot.Order)
+                        .ThenInclude(o => o.Customer)
+                    .Include(ot => ot.Order)
+                        .ThenInclude(o => o.OrderDetails)
+                        .ThenInclude(d => d.MenuItem)
+                    .Include(ot => ot.Order)
+                        .ThenInclude(o => o.OrderTables)
+                        .ThenInclude(ot => ot.Table)
+                    .Include(ot => ot.Order)
+                        .ThenInclude(o => o.Invoices)
+                    .Where(ot => ot.TableId == tableId
+                        && ot.Order.Status != "Completed"
+                        && ot.Order.Status != "Cancelled")
+                    .Select(ot => ot.Order)
+                    .FirstOrDefaultAsync();
+
+                if (currentOrder == null)
+                {
+                    return NotFound(new
+                    {
+                        message = $"Bàn {table.TableNumber} chưa có order đang hoạt động.",
+                        tableNumber = table.TableNumber,
+                        tableStatus = table.Status
+                    });
+                }
+
+                return Ok(MapToDto(currentOrder));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new
+                {
+                    message = "Lỗi khi lấy order hiện tại.",
+                    error = ex.Message
+                });
+            }
+        }
+
+        /// <summary>
+        /// GET: Lấy order hiện tại với Token validation (Customer)
+        /// Yêu cầu token hợp lệ trong header
+        /// </summary>
+        [Authorize]
+        [HttpGet("my-order")]
+        public async Task<ActionResult<OrderDTO>> GetMyCurrentOrder()
+        {
+            try
+            {
+                // Lấy tableId và orderId từ token claims
+                var tableIdClaim = User.FindFirst("tableId")?.Value;
+                var orderIdClaim = User.FindFirst("orderId")?.Value;
+
+                if (string.IsNullOrEmpty(tableIdClaim) || string.IsNullOrEmpty(orderIdClaim))
+                {
+                    return Unauthorized(new { message = "Token không hợp lệ hoặc thiếu thông tin." });
+                }
+
+                if (!int.TryParse(tableIdClaim, out int tableId) || !int.TryParse(orderIdClaim, out int orderId))
+                {
+                    return BadRequest(new { message = "Thông tin token không đúng định dạng." });
+                }
+
+                // Lấy order
+                var order = await _context.Orders
+                    .Include(o => o.Staff)
+                    .Include(o => o.Customer)
+                    .Include(o => o.OrderDetails)
+                        .ThenInclude(d => d.MenuItem)
+                    .Include(o => o.OrderTables)
+                        .ThenInclude(ot => ot.Table)
+                    .Include(o => o.Invoices)
+                    .FirstOrDefaultAsync(o => o.Id == orderId);
+
+                if (order == null)
+                {
+                    return NotFound(new { message = $"Order {orderId} không tồn tại." });
+                }
+                               
+                if (!order.OrderTables.Any(ot => ot.TableId == tableId))
+                {
+                    return Forbid(); // 403 - Token không match với order
+                }
+                            
+                if (order.Status == "Completed" || order.Status == "Cancelled")
+                {
+                    return BadRequest(new
+                    {
+                        message = "Order này đã kết thúc.",
+                        status = order.Status
+                    });
+                }
+
+                return Ok(MapToDto(order));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new
+                {
+                    message = "Lỗi khi lấy order.",
+                    error = ex.Message
+                });
+            }
+        }
+
+        /// <summary>
+        /// POST: Kích hoạt bàn và tạo order (Staff) 
+        /// </summary>
+        [Authorize(Roles = "Admin,Staff")]
+        [HttpPost("activate-table/{tableId}")]
+        public async Task<ActionResult> ActivateTable(int tableId, [FromBody] ActivateTableDto dto)
+        {
+            using var transaction = await _context.Database.BeginTransactionAsync();
+            try
+            {    
+
+                var table = await _context.Tables.FindAsync(tableId);
+                if (table == null)
+                    return NotFound(new { message = $"Bàn {tableId} không tồn tại." });
+
+                if (table.Status == "Occupied")
+                    return BadRequest(new { message = "Bàn đã có khách." });
+
+                var existingOrder = await _context.OrderTables
+                    .Include(ot => ot.Order)
+                    .Where(ot => ot.TableId == tableId
+                        && ot.Order.Status != "Completed"
+                        && ot.Order.Status != "Cancelled")
+                    .FirstOrDefaultAsync();
+
+                if (existingOrder != null)
+                    return BadRequest(new { message = "Bàn đã có order đang hoạt động." });
+
+                // Get staff
+                User? staff = null;
+                var staffIdClaim = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+
+                if (!string.IsNullOrEmpty(staffIdClaim))
+                {
+                    staff = await _context.Users.FirstOrDefaultAsync(s => s.Username == staffIdClaim);
+                    Console.WriteLine($"✅ Found staff from claim: {staff?.Username}");
+                }
+
+                if (staff == null)
+                {
+                    staff = await _context.Users.FirstOrDefaultAsync(s => s.Role == Models.Entities.User.UserRole.Admin);
+                    Console.WriteLine($"⚠️ Using fallback admin: {staff?.Username}");
+                }
+
+                if (staff == null)
+                {
+                    return StatusCode(500, new { message = "Không tìm thấy staff/admin." });
+                }
+
+                // Link hoặc tạo Customer
+                int? customerId = null;
+                if (!string.IsNullOrEmpty(dto.CustomerPhone))
+                {
+                    var customer = await _context.Customer
+                        .FirstOrDefaultAsync(c => c.Phone == dto.CustomerPhone);
+
+                    if (customer != null)
+                    {
+                        customerId = customer.Id;
+                    }
+                    else if (!string.IsNullOrEmpty(dto.CustomerName))
+                    {
+                        var newCustomer = new Customer
+                        {
+                            FullName = dto.CustomerName,
+                            Phone = dto.CustomerPhone,
+                            CreatedAt = DateTime.UtcNow,
+                            UpdatedAt = DateTime.UtcNow
+                        };
+                        _context.Customer.Add(newCustomer);
+                        await _context.SaveChangesAsync();
+                        customerId = newCustomer.Id;
+                    }
+                }
+
+                var order = new Order
+                {
+                    OrderNumber = $"ORD-{DateTime.Now:yyyyMMddHHmmss}",
+                    StaffId = staff.Id,
+                    CustomerId = customerId,
+                    NumberOfGuests = dto.NumberOfGuests ?? 1,
+                    OrderType = "DineIn",
+                    OrderTime = DateTime.UtcNow,
+                    CreatedAt = DateTime.UtcNow,
+                    UpdatedAt = DateTime.UtcNow,
+                    Status = "Ordered",
+                    SubTotal = 0,
+                    DiscountAmount = 0,
+                    TaxAmount = 0,
+                    TotalAmount = 0
+                };
+
+                _context.Orders.Add(order);
+                await _context.SaveChangesAsync();
+                Console.WriteLine($"✅ Order created with ID: {order.Id}");
+
+                _context.OrderTables.Add(new OrderTable
+                {
+                    TableId = tableId,
+                    OrderId = order.Id
+                });
+
+                table.Status = "Occupied";
+                table.Capacity = dto.NumberOfGuests ?? 1;
+
+                // Generate JWT Token
+                var token = GenerateTableToken(tableId, order.Id);
+                Console.WriteLine($"🔑 Token generated (first 50 chars): {token.Substring(0, Math.Min(50, token.Length))}...");
+
+               
+                var frontendUrl = "https://webdemocuahangtraicay.io.vn";
+                var qrUrl = $"{frontendUrl}/order?tableId={tableId}";              
+
+                table.QrCodeUrl = qrUrl;
+
+                await _context.SaveChangesAsync();
+                Console.WriteLine($"✅ Changes saved to DB");
+
+                await transaction.CommitAsync();
+                Console.WriteLine($"✅ Transaction committed");
+
+                var createdOrder = await _context.Orders
+                    .Include(o => o.Staff)
+                    .Include(o => o.Customer)
+                    .Include(o => o.OrderDetails).ThenInclude(d => d.MenuItem)
+                    .Include(o => o.OrderTables).ThenInclude(ot => ot.Table)
+                    .FirstAsync(o => o.Id == order.Id);
+
+                var response = new
+                {
+                    message = $"Đã kích hoạt bàn {table.TableNumber} thành công.",
+                    order = MapToDto(createdOrder),
+                    qrUrl = qrUrl,
+                    token = token,
+                    tableId = tableId,
+                    orderId = order.Id
+                };
+
+                Console.WriteLine($"📤 Response ready. Token length: {token.Length}, QR URL length: {qrUrl.Length}");
+
+                return Ok(response);
+            }
+            catch (Exception ex)
+            {
+                await transaction.RollbackAsync();
+                Console.WriteLine($"❌ ERROR in ActivateTable: {ex.Message}");
+                Console.WriteLine($"❌ Stack: {ex.StackTrace}");
+                return StatusCode(500, new { message = "Lỗi kích hoạt bàn.", error = ex.Message, stack = ex.StackTrace });
+            }
+        }
+
+        /// <summary>
+        /// GET: Quét QR code bàn → nhận token (Customer)
+        /// </summary>
+        [AllowAnonymous]
+        [HttpGet("scan-table/{tableId}")]
+        public async Task<ActionResult<ScanTableResponse>> ScanTable(int tableId)
+        {
+            try
+            {
+                var table = await _context.Tables.FindAsync(tableId);
+                if (table == null)
+                    return NotFound(new { message = $"Bàn {tableId} không tồn tại." });
+
+                var existingOrder = await _context.OrderTables
+                    .Include(ot => ot.Order).ThenInclude(o => o.Staff)
+                    .Include(ot => ot.Order).ThenInclude(o => o.OrderDetails).ThenInclude(d => d.MenuItem)
+                    .Include(ot => ot.Order).ThenInclude(o => o.OrderTables).ThenInclude(ot => ot.Table)
+                    .Where(ot => ot.TableId == tableId
+                        && ot.Order.Status != "Completed"
+                        && ot.Order.Status != "Cancelled")
+                    .Select(ot => ot.Order)
+                    .FirstOrDefaultAsync();
+
+                if (existingOrder == null)
+                {
+                    return NotFound(new
+                    {
+                        message = "Bàn chưa được kích hoạt. Vui lòng gọi nhân viên để tạo order.",
+                        tableNumber = table.TableNumber,
+                        status = table.Status
+                    });
+                }
+
+                
+                var token = GenerateTableToken(tableId, existingOrder.Id);
+
+                var frontendUrl = _configuration["FrontendUrl"] ?? "https://webdemocuahangtraicay.io.vn";
+                var newQrUrl = $"{frontendUrl}/order?tableId={tableId}";
+
+                if (string.IsNullOrEmpty(table.QrCodeUrl) || !table.QrCodeUrl.Contains("token="))
+                {
+                    table.QrCodeUrl = newQrUrl;
+                    await _context.SaveChangesAsync();
+                }
+
+                return Ok(new ScanTableResponse
+                {
+                    Created = false,
+                    Message = "Kết nối thành công. Bạn có thể bắt đầu gọi món.",
+                    Order = MapToDto(existingOrder),
+                    Token = token,
+                    ExpiresIn = 14400,
+                    QrUrl = newQrUrl 
+                });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { message = "Lỗi quét bàn.", error = ex.Message });
+            }
+        }
+
+        /// <summary>
+        /// POST: Regenerate QR code cho bàn đang hoạt động
+        /// Dùng khi cần tạo lại QR cho bàn cũ
+        /// </summary>
+       // [Authorize(Roles = "Admin,Staff")]
+        [AllowAnonymous]
+        [HttpPost("regenerate-qr/{tableId}")]
+        public async Task<IActionResult> RegenerateQR(int tableId)
+        {
+            try
+            {
+                var table = await _context.Tables.FindAsync(tableId);
+                if (table == null)
+                    return NotFound(new { message = $"Bàn {tableId} không tồn tại." });
+
+                // Tìm order đang active của bàn này
+                var activeOrder = await _context.OrderTables
+                    .Include(ot => ot.Order)
+                    .Where(ot => ot.TableId == tableId
+                        && ot.Order.Status != "Completed"
+                        && ot.Order.Status != "Cancelled")
+                    .Select(ot => ot.Order)
+                    .FirstOrDefaultAsync();
+
+                if (activeOrder == null)
+                    return BadRequest(new { message = "Bàn không có order đang hoạt động." });
+
+                // Generate token mới
+                var token = GenerateTableToken(tableId, activeOrder.Id);
+
+                // Generate QR URL mới với token
+                var frontendUrl = _configuration["FrontendUrl"] ?? "http://localhost:5173";
+                var qrUrl = $"{frontendUrl}/order?tableId={tableId}&token={token}";
+
+                // Update QR URL
+                table.QrCodeUrl = qrUrl;
+                await _context.SaveChangesAsync();
+
+                return Ok(new
+                {
+                    message = $"Đã tạo lại QR code cho bàn {table.TableNumber}",
+                    qrUrl = qrUrl,
+                    token = token
+                });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { message = "Lỗi tạo lại QR code.", error = ex.Message });
+            }
+        }
+
+        /// <summary>
+        /// POST: Migration - Update tất cả QR codes cũ với token
+        /// Chạy 1 lần để fix tất cả bàn hiện tại
+        /// </summary>
+        //  [Authorize(Roles = "Admin")]
+        [AllowAnonymous]
+        [HttpPost("admin/migrate-qr-codes")]
+        public async Task<IActionResult> MigrateAllQRCodes()
+        {
+            try
+            {
+                var activeTables = await _context.OrderTables
+                    .Include(ot => ot.Table)
+                    .Include(ot => ot.Order)
+                    .Where(ot => ot.Order.Status != "Completed" && ot.Order.Status != "Cancelled")
+                    .ToListAsync();
+
+                int updatedCount = 0;
+                var frontendUrl = _configuration["FrontendUrl"] ?? "http://localhost:5173";
+
+                foreach (var ot in activeTables)
+                {
+                    var table = ot.Table;
+                    var order = ot.Order;
+
+                    // Skip nếu đã có token
+                    if (!string.IsNullOrEmpty(table.QrCodeUrl) && table.QrCodeUrl.Contains("token="))
+                        continue;
+
+                    // Generate token mới
+                    var token = GenerateTableToken(table.Id, order.Id);
+                    var qrUrl = $"{frontendUrl}/order?tableId={table.Id}&token={token}";
+
+                    table.QrCodeUrl = qrUrl;
+                    updatedCount++;
+                }
+
+                await _context.SaveChangesAsync();
+
+                return Ok(new
+                {
+                    message = $"Đã cập nhật {updatedCount} QR codes.",
+                    totalChecked = activeTables.Count,
+                    updated = updatedCount
+                });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { message = "Lỗi migration.", error = ex.Message });
+            }
+        }
+
+        /// <summary>
+        /// POST: Yêu cầu thanh toán (Staff từ POS)
+        /// ✅ NEW: Endpoint này cho staff request payment từ POS
+        /// </summary>
+        [AllowAnonymous]
+        [HttpPost("{id}/request-payment")]
+        public async Task<IActionResult> RequestPayment(int id)
+        {
+            try
+            {
+                var order = await _context.Orders
+                    .Include(o => o.OrderDetails)
+                    .Include(o => o.OrderTables)
+                        .ThenInclude(ot => ot.Table)
+                    .FirstOrDefaultAsync(o => o.Id == id);
+
+                if (order == null)
+                    return NotFound(new { message = $"Order {id} không tồn tại." });
+
+                if (order.Status != "Ordered")
+                    return BadRequest(new { message = "Chỉ có thể yêu cầu thanh toán cho đơn đang 'Ordered'." });
+
+                if (!order.OrderDetails.Any())
+                    return BadRequest(new { message = "Đơn hàng không có món nào." });
+
+                // Update order status
+                order.Status = "PendingPayment";
+                order.UpdatedAt = DateTime.UtcNow;
+
+                // ✅ TẠO NOTIFICATION CHO STAFF
+                var table = order.OrderTables.FirstOrDefault()?.Table;
+                var notification = new Notification
+                {
+                    Type = "PaymentRequest",
+                    TargetRole = "Staff",
+                    TableId = table?.Id,
+                    OrderId = order.Id,
+                    ReferenceId = order.Id,
+                    Title = $"💳 Yêu cầu thanh toán - Bàn {table?.TableNumber ?? 0}",
+                    Message = $"Khách yêu cầu thanh toán cho đơn hàng #{order.OrderNumber}. Tổng tiền: {order.TotalAmount:N0}đ",
+                    Payload = System.Text.Json.JsonSerializer.Serialize(new
+                    {
+                        orderId = order.Id,
+                        orderNumber = order.OrderNumber,
+                        tableId = table?.Id,
+                        tableNumber = table?.TableNumber,
+                        totalAmount = order.TotalAmount,
+                        requestType = "request_payment"
+                    }),
+                    CreatedAt = DateTime.UtcNow
+                };
+
+                _context.Notifications.Add(notification);
+                await _context.SaveChangesAsync();
+
+                return Ok(new
+                {
+                    message = "Yêu cầu thanh toán đã được gửi! Nhân viên sẽ đến ngay.",
+                    orderId = id,
+                    status = "PendingPayment"
+                });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { message = "Lỗi xử lý yêu cầu thanh toán.", error = ex.Message });
+            }
+        }
+
+        /// <summary>
+        /// POST: Hoàn tất thanh toán (Staff từ POS)
+        /// ✅ NEW: Tạo invoice qua InvoicesController và complete order
+        /// </summary>
+       // [Authorize(Roles = "Admin,Staff")]
+        [AllowAnonymous]
+        [HttpPost("{id}/complete")]
+        public async Task<IActionResult> CompleteOrderWithInvoice( int id, [FromBody] CompleteOrderDto dto)
+        {
+            using var transaction = await _context.Database.BeginTransactionAsync();
+            try
+            {
+                var order = await _context.Orders
+                    .Include(o => o.OrderTables)
+                    .ThenInclude(ot => ot.Table)
+                    .Include(o => o.OrderDetails)
+                    .FirstOrDefaultAsync(o => o.Id == id);
+
+                if (order == null)
+                    return NotFound(new { message = $"Order {id} không tồn tại." });
+
+                if (order.Status == "Completed")
+                    return BadRequest(new { message = "Order đã hoàn tất rồi." });
+
+                // Kiểm tra xem đã có invoice chưa
+                var existingInvoice = await _context.Invoices
+                    .FirstOrDefaultAsync(i => i.OrderId == id);
+
+                Invoice invoice;
+
+                if (existingInvoice != null)
+                {
+                    // Nếu đã có invoice → update
+                    invoice = existingInvoice;
+                    invoice.Status = "Paid";
+                    invoice.ReceivedAmount = dto.ReceivedAmount;
+                    invoice.ChangeAmount = dto.ReceivedAmount - invoice.Amount;
+                    invoice.PaymentTime = DateTime.UtcNow;
+                    invoice.UpdatedAt = DateTime.UtcNow;
+
+                }
+                else
+                {                   
+                    var staffIdClaim = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+                    var staff = await _context.Users.FirstOrDefaultAsync(s => s.Username == staffIdClaim);
+
+                    invoice = new Invoice
+                    {
+                        OrderId = order.Id,
+                        Amount = order.TotalAmount,
+                        Status = "Paid",
+                        PaymentTime = DateTime.UtcNow,
+                        ReceivedAmount = dto.ReceivedAmount,
+                        ChangeAmount = dto.ChangeAmount - order.TotalAmount,
+                        CreatedBy = staff?.Id ?? 1,
+                        CreatedAt = DateTime.UtcNow,
+                        UpdatedAt = DateTime.UtcNow
+                    };
+
+                    _context.Invoices.Add(invoice);
+                }
+
+                // Complete order và giải phóng bàn
+                order.Status = "Completed";
+                order.CompletedTime = DateTime.UtcNow;
+                order.UpdatedAt = DateTime.UtcNow;
+
+                foreach (var ot in order.OrderTables)
+                {
+                    ot.Table.Status = "Available";
+                    ot.Table.QrCodeUrl = null; // Reset QR
+                }
+
+                await _context.SaveChangesAsync();
+                await transaction.CommitAsync();
+
+                return Ok(new
+                {
+                    message = "Thanh toán thành công và đã giải phóng bàn.",
+                    invoiceId = invoice.Id
+                });
+            }
+            catch (Exception ex)
+            {
+                await transaction.RollbackAsync();
+                return StatusCode(500, new { message = "Lỗi hoàn tất đơn hàng.", error = ex.Message });
+            }
+        }
+
+        /// <summary>
+        /// PUT: Áp dụng khuyến mãi vào order
+        /// </summary>
+        [AllowAnonymous]
+        [HttpPut("{id}/apply-promotion")]
+        public async Task<IActionResult> ApplyPromotionToOrder(int id, [FromBody] ApplyPromotionDto dto)
+        {
+            using var transaction = await _context.Database.BeginTransactionAsync();
+            try
+            {
+                var order = await _context.Orders
+                    .Include(o => o.OrderDetails)
+                    .FirstOrDefaultAsync(o => o.Id == id);
+
+                if (order == null)
+                    return NotFound(new { message = $"Order {id} không tồn tại." });
+
+                if (order.Status != "Ordered")
+                    return BadRequest(new { message = "Chỉ có thể áp dụng khuyến mãi cho đơn đang 'Ordered'." });
+
+                // Kiểm tra promotion có tồn tại và còn hiệu lực không
+                var promotion = await _context.Promotions.FindAsync(dto.PromotionId);
+                if (promotion == null)
+                    return NotFound(new { message = "Khuyến mãi không tồn tại." });
+
+                if (!promotion.Active || promotion.EndDate == DateTime.UtcNow)
+                    return BadRequest(new { message = "Khuyến mãi không còn hiệu lực hoặc đã hết hạn." });
+
+                decimal subTotal = order.OrderDetails.Sum(d => d.UnitPrice * d.Quantity);
+                decimal discountFromItems = order.DiscountAmount; 
+                decimal promotionDiscount = dto.DiscountAmount;   
+
+               
+                decimal totalDiscount = discountFromItems + promotionDiscount;
+
+               
+                decimal taxAmount = (subTotal - totalDiscount) * 0.1m;
+                decimal totalAmount = subTotal - totalDiscount + taxAmount;
+
+               
+                order.DiscountAmount = totalDiscount;
+                order.TaxAmount = taxAmount;
+                order.TotalAmount = totalAmount;
+                order.UpdatedAt = DateTime.UtcNow;
+                order.AppliedPromotionId = promotion.Id; 
+                await _context.SaveChangesAsync();
+                await transaction.CommitAsync();
+
+                return Ok(new
+                {
+                    success = true,
+                    message = $"Đã áp dụng khuyến mãi {promotion.Code}",
+                    data = new
+                    {
+                        orderId = order.Id,
+                        promotionCode = promotion.Code,
+                        promotionName = promotion.Name,
+                        discountAmount = promotionDiscount,
+                        totalDiscount = totalDiscount,
+                        newTotal = totalAmount
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                await transaction.RollbackAsync();
+                return StatusCode(500, new { message = "Lỗi áp dụng khuyến mãi.", error = ex.Message });
+            }
+        }
+
+        /// <summary>
+        /// POST: Khôi phục order về trạng thái Ordered nếu thanh toán thất bại
+        /// </summary>
+        [AllowAnonymous]
+        [HttpPost("{id}/revert-to-ordered")]
+        public async Task<IActionResult> RevertToOrdered(int id)
+        {
+            using var transaction = await _context.Database.BeginTransactionAsync();
+            try
+            {
+                var order = await _context.Orders
+                    .Include(o => o.OrderTables)
+                    .ThenInclude(ot => ot.Table)
+                    .FirstOrDefaultAsync(o => o.Id == id);
+
+                if (order == null)
+                    return NotFound(new { message = $"Order {id} không tồn tại." });
+
+                if (order.Status != "PendingPayment")
+                    return BadRequest(new { message = "Chỉ có thể khôi phục order đang ở trạng thái 'PendingPayment'." });
+
+               
+                order.Status = "Ordered";
+                order.UpdatedAt = DateTime.UtcNow;
+
+              
+                var pendingInvoices = await _context.Invoices
+                    .Where(i => i.OrderId == id && i.Status == "Pending")
+                    .ToListAsync();
+
+                if (pendingInvoices.Any())
+                {
+                    _context.Invoices.RemoveRange(pendingInvoices);
+                }
+
+                await _context.SaveChangesAsync();
+                await transaction.CommitAsync();
+
+                return Ok(new
+                {
+                    message = "Đã khôi phục order về trạng thái 'Ordered'.",
+                    orderId = id,
+                    status = "Ordered"
+                });
+            }
+            catch (Exception ex)
+            {
+                await transaction.RollbackAsync();
+                return StatusCode(500, new { message = "Lỗi khôi phục order.", error = ex.Message });
+            }
+        }
+
+        private string GenerateTableToken(int tableId, int orderId)
+        {
+            try
+            {          
+                              
+                if (string.IsNullOrEmpty(_jwtkey))
+                {
+                    throw new InvalidOperationException("❌ JWT Key is NULL or empty in configuration!");
+                }                
+
+               
+                var securityKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_jwtkey));
+                var credentials = new SigningCredentials(securityKey, SecurityAlgorithms.HmacSha256);
+
+                
+                var claims = new[]
+                {
+                    new Claim("tableId", tableId.ToString()),
+                    new Claim("orderId", orderId.ToString()),
+                    new Claim("type", "table-access"),
+                    new Claim("role", "Customer"),
+                    new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString()),
+                    new Claim(JwtRegisteredClaimNames.Iat,
+                    DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString(),
+                    ClaimValueTypes.Integer64)
+                };
+
+                // ✅ Tạo token
+                var token = new JwtSecurityToken(
+                    issuer: _configuration["Jwt:Issuer"],
+                    audience: _configuration["Jwt:Audience"],
+                    claims: claims,
+                    expires: DateTime.UtcNow.AddHours(4), // 4 giờ
+                    signingCredentials: credentials
+                );
+
+                var tokenString = new JwtSecurityTokenHandler().WriteToken(token);
+                Console.WriteLine($"✅ Token created. Length: {tokenString.Length}");
+
+                return tokenString;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"❌ Error generating token: {ex.Message}");
+                throw;
+            }
+        }
+
+        private static OrderDTO MapToDto(Order o)
+        {
+            var customerName = o.Customer?.FullName ?? "Khách hàng";
+            var customerPhone = o.Customer?.Phone ?? "";
+
+            return new OrderDTO
+            {
+                Id = o.Id,
+                OrderNumber = o.OrderNumber,
+                Status = o.Status,
+                CustomerName = customerName,
+                CustomerPhone = customerPhone,
+                NumberOfGuests = o.NumberOfGuests,
+                OrderType = o.OrderType,
+                SubTotal = o.SubTotal,
+                DiscountAmount = o.DiscountAmount,
+                TaxAmount = o.TaxAmount,
+                TotalAmount = o.TotalAmount,
+                OrderTime = o.OrderTime,
+                CreatedAt = o.CreatedAt,
+                CompletedTime = o.CompletedTime,
+                Staff = o.Staff == null ? null : new StaffDTO
+                {
+                    Id = o.Staff.Id,
+                    Username = o.Staff.Username
+                },
+                Tables = o.OrderTables?.Select(ot => new TableDTO
+                {
+                    Id = ot.Table.Id,
+                    TableNumber = ot.Table.TableNumber,
+                    Capacity = ot.Table.Capacity
+                }).ToList() ?? new List<TableDTO>(),
+                OrderDetails = o.OrderDetails?.Select(d => new OrderDetailDTO
+                {
+                    Id = d.Id,
+                    MenuItemId = d.MenuItemId,
+                    MenuItemName = d.MenuItem?.Name ?? "",
+                    Quantity = d.Quantity,
+                    UnitPrice = d.UnitPrice,
+                    Note = d.Note,
+                    Status = d.Status
+                }).ToList() ?? new List<OrderDetailDTO>(),
+                 AppliedPromotion = o.AppliedPromotion == null ? null : new PromotionDTO
+                 {
+                     Id = o.AppliedPromotion.Id,
+                     Code = o.AppliedPromotion.Code,
+                     Name = o.AppliedPromotion.Name,
+                     DiscountPercent = o.AppliedPromotion.DiscountPercent,
+                     DiscountAmount = o.AppliedPromotion.DiscountAmount
+                 }
+            };
+        }
+    }
+}
+

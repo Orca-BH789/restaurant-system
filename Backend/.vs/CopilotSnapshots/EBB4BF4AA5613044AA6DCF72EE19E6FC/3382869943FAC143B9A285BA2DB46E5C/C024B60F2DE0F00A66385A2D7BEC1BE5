@@ -1,0 +1,589 @@
+﻿using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using Restaurant_Management.Data;
+using Restaurant_Management.Models.DTO;
+using Restaurant_Management.Models.Entities;
+
+namespace Restaurant_Management.Controllers
+{
+    [Authorize]
+    [Route("api/[controller]")]
+    [ApiController]
+    public class CustomersController : ControllerBase
+    {
+        private readonly RestaurantDbContext _context;
+        private readonly ILogger<CustomersController> _logger;
+
+        public CustomersController(RestaurantDbContext context, ILogger<CustomersController> logger)
+        {
+            _context = context;
+            _logger = logger;
+        }
+
+        // ============================================
+        // 🔹 GET: Lấy danh sách customers (with pagination & filter)
+        // ============================================
+        /// <summary>
+        /// GET: Lấy danh sách khách hàng với filter, search, pagination
+        /// </summary>
+        [HttpGet]
+        [ProducesResponseType(typeof(PagedCustomerResponseDTO), StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status400BadRequest)]
+        public async Task<ActionResult<PagedCustomerResponseDTO>> GetCustomers(
+            [FromQuery] string? searchTerm,
+            [FromQuery] string? sortBy = "Id",
+            [FromQuery] bool isDescending = false,
+            [FromQuery] int pageNumber = 1,
+            [FromQuery] int pageSize = 10,
+            [FromQuery] DateTime? fromDate = null,
+            [FromQuery] DateTime? toDate = null,
+            [FromQuery] bool? hasOrders = null)
+        {
+            try
+            {
+                // Validate pagination
+                if (pageNumber < 1 || pageSize < 1 || pageSize > 100)
+                    return BadRequest(new { message = "PageNumber phải >= 1, PageSize phải từ 1-100" });
+
+                // Build query
+                var query = _context.Customer
+                    .Include(c => c.Orders)
+                    .Include(c => c.Reservations)
+                    .AsQueryable();
+
+                // Search filter
+                if (!string.IsNullOrWhiteSpace(searchTerm))
+                {
+                    query = query.Where(c =>
+                        c.FullName.Contains(searchTerm) ||
+                        c.Phone.Contains(searchTerm) ||
+                        c.Email.Contains(searchTerm));
+                }
+
+                // Date filter
+                if (fromDate.HasValue)
+                    query = query.Where(c => c.CreatedAt >= fromDate.Value);
+
+                if (toDate.HasValue)
+                    query = query.Where(c => c.CreatedAt <= toDate.Value);
+
+                // Has orders filter
+                if (hasOrders.HasValue)
+                {
+                    if (hasOrders.Value)
+                        query = query.Where(c => c.Orders.Any());
+                    else
+                        query = query.Where(c => !c.Orders.Any());
+                }
+
+                // Count before pagination
+                var totalCount = await query.CountAsync();
+
+                // Sort
+                var validSortFields = new[] { "Id", "FullName", "Phone", "Email", "CreatedAt", "UpdatedAt" };
+                if (!validSortFields.Contains(sortBy))
+                    sortBy = "Id";
+
+                query = isDescending
+                    ? query.OrderBy($"{sortBy} desc")
+                    : query.OrderBy(sortBy);
+
+                // Pagination
+                var customers = await query
+                    .Skip((pageNumber - 1) * pageSize)
+                    .Take(pageSize)
+                    .ToListAsync();
+
+                // Map to DTO
+                var customerDTOs = customers.Select(MapToDTO).ToList();
+
+                var response = new PagedCustomerResponseDTO
+                {
+                    Data = customerDTOs,
+                    TotalCount = totalCount,
+                    PageNumber = pageNumber,
+                    PageSize = pageSize
+                };
+
+                return Ok(response);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error getting customers");
+                return StatusCode(500, new { message = "Lỗi khi lấy danh sách khách hàng", error = ex.Message });
+            }
+        }
+
+        // ============================================
+        // 🔹 GET by ID: Lấy customer chi tiết
+        // ============================================
+        /// <summary>
+        /// GET: Lấy thông tin chi tiết 1 khách hàng (kèm Orders & Reservations)
+        /// </summary>
+        [HttpGet("{id}")]
+        [ProducesResponseType(typeof(CustomerDetailDTO), StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status404NotFound)]
+        public async Task<ActionResult<CustomerDetailDTO>> GetCustomer(int id)
+        {
+            try
+            {
+                var customer = await _context.Customer
+                    .Include(c => c.Orders)
+                    .Include(c => c.Reservations)
+                    .FirstOrDefaultAsync(c => c.Id == id);
+
+                if (customer == null)
+                    return NotFound(new { message = $"Không tìm thấy khách hàng với Id = {id}" });
+
+                var dto = MapToDetailDTO(customer);
+                return Ok(dto);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Error getting customer {id}");
+                return StatusCode(500, new { message = "Lỗi khi lấy thông tin khách hàng", error = ex.Message });
+            }
+        }
+
+        // ============================================
+        // 🔹 GET by Phone: Lấy customer theo số điện thoại
+        // ============================================
+        /// <summary>
+        /// GET: Tìm khách hàng theo số điện thoại
+        /// </summary>
+        [AllowAnonymous]
+        [HttpGet("phone/{phone}")]
+        [ProducesResponseType(typeof(CustomerDetailDTO), StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status404NotFound)]
+        public async Task<ActionResult<CustomerDetailDTO>> GetCustomerByPhone(string phone)
+        {
+            try
+            {
+                var customer = await _context.Customer
+                    .Include(c => c.Orders)
+                    .Include(c => c.Reservations)
+                    .FirstOrDefaultAsync(c => c.Phone == phone);
+
+                if (customer == null)
+                    return NotFound(new { message = $"Không tìm thấy khách hàng với số điện thoại = {phone}" });
+
+                var dto = MapToDetailDTO(customer);
+                return Ok(dto);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Error getting customer by phone {phone}");
+                return StatusCode(500, new { message = "Lỗi khi tìm khách hàng", error = ex.Message });
+            }
+        }
+
+        // ============================================
+        // 🔹 GET by Email: Lấy customer theo email
+        // ============================================
+        /// <summary>
+        /// GET: Tìm khách hàng theo email
+        /// </summary>
+        [HttpGet("email/{email}")]
+        [ProducesResponseType(typeof(CustomerDetailDTO), StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status404NotFound)]
+        public async Task<ActionResult<CustomerDetailDTO>> GetCustomerByEmail(string email)
+        {
+            try
+            {
+                var customer = await _context.Customer
+                    .Include(c => c.Orders)
+                    .Include(c => c.Reservations)
+                    .FirstOrDefaultAsync(c => c.Email == email);
+
+                if (customer == null)
+                    return NotFound(new { message = $"Không tìm thấy khách hàng với email = {email}" });
+
+                var dto = MapToDetailDTO(customer);
+                return Ok(dto);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Error getting customer by email {email}");
+                return StatusCode(500, new { message = "Lỗi khi tìm khách hàng", error = ex.Message });
+            }
+        }
+
+        // ============================================
+        // 🔹 POST: Tạo customer mới
+        // ============================================
+        /// <summary>
+        /// POST: Tạo khách hàng mới
+        /// </summary>
+        [HttpPost]
+        [ProducesResponseType(typeof(CustomerDTO), StatusCodes.Status201Created)]
+        [ProducesResponseType(StatusCodes.Status400BadRequest)]
+        [ProducesResponseType(StatusCodes.Status409Conflict)]
+        public async Task<ActionResult<CustomerDTO>> PostCustomer([FromBody] CreateCustomerDTO dto)
+        {
+            try
+            {
+                // Validate
+                if (string.IsNullOrWhiteSpace(dto.FullName))
+                    return BadRequest(new { message = "FullName không được để trống" });
+
+                if (dto.FullName.Length > 100)
+                    return BadRequest(new { message = "FullName không được vượt quá 100 ký tự" });
+
+                if (!string.IsNullOrEmpty(dto.Phone) && dto.Phone.Length > 15)
+                    return BadRequest(new { message = "Phone không được vượt quá 15 ký tự" });
+
+                if (!string.IsNullOrEmpty(dto.Email) && dto.Email.Length > 100)
+                    return BadRequest(new { message = "Email không được vượt quá 100 ký tự" });
+
+                // Check duplicate phone
+                if (!string.IsNullOrEmpty(dto.Phone))
+                {
+                    var existingPhone = await _context.Customer
+                        .AnyAsync(c => c.Phone == dto.Phone);
+                    if (existingPhone)
+                        return Conflict(new { message = $"Khách hàng với số điện thoại '{dto.Phone}' đã tồn tại" });
+                }
+
+                // Check duplicate email
+                if (!string.IsNullOrEmpty(dto.Email))
+                {
+                    var existingEmail = await _context.Customer
+                        .AnyAsync(c => c.Email == dto.Email);
+                    if (existingEmail)
+                        return Conflict(new { message = $"Khách hàng với email '{dto.Email}' đã tồn tại" });
+                }
+
+                var customer = new Customer
+                {
+                    FullName = dto.FullName.Trim(),
+                    Phone = string.IsNullOrEmpty(dto.Phone) ? null : dto.Phone.Trim(),
+                    Email = string.IsNullOrEmpty(dto.Email) ? null : dto.Email.Trim(),
+                    CreatedAt = DateTime.UtcNow,
+                    UpdatedAt = DateTime.UtcNow
+                };
+
+                _context.Customer.Add(customer);
+                await _context.SaveChangesAsync();
+
+                _logger.LogInformation($"Created new customer: {customer.Id} - {customer.FullName}");
+
+                var responseDTO = MapToDTO(customer);
+                return CreatedAtAction(nameof(GetCustomer), new { id = customer.Id }, responseDTO);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error creating customer");
+                return StatusCode(500, new { message = "Lỗi khi tạo khách hàng", error = ex.Message });
+            }
+        }
+
+        // ============================================
+        // 🔹 PUT: Cập nhật customer
+        // ============================================
+        /// <summary>
+        /// PUT: Cập nhật thông tin khách hàng
+        /// </summary>
+        [HttpPut("{id}")]
+        [ProducesResponseType(StatusCodes.Status204NoContent)]
+        [ProducesResponseType(StatusCodes.Status400BadRequest)]
+        [ProducesResponseType(StatusCodes.Status404NotFound)]
+        [ProducesResponseType(StatusCodes.Status409Conflict)]
+        public async Task<IActionResult> PutCustomer(int id, [FromBody] UpdateCustomerDTO dto)
+        {
+            try
+            {
+                if (id != dto.Id)
+                    return BadRequest(new { message = "Id trong URL không khớp với dữ liệu gửi lên" });
+
+                // Validate
+                if (string.IsNullOrWhiteSpace(dto.FullName))
+                    return BadRequest(new { message = "FullName không được để trống" });
+
+                if (dto.FullName.Length > 100)
+                    return BadRequest(new { message = "FullName không được vượt quá 100 ký tự" });
+
+                if (!string.IsNullOrEmpty(dto.Phone) && dto.Phone.Length > 15)
+                    return BadRequest(new { message = "Phone không được vượt quá 15 ký tự" });
+
+                if (!string.IsNullOrEmpty(dto.Email) && dto.Email.Length > 100)
+                    return BadRequest(new { message = "Email không được vượt quá 100 ký tự" });
+
+                var customer = await _context.Customer.FindAsync(id);
+                if (customer == null)
+                    return NotFound(new { message = $"Không tìm thấy khách hàng với Id = {id}" });
+
+                // Check duplicate phone (nếu phone thay đổi)
+                if (!string.IsNullOrEmpty(dto.Phone) && dto.Phone != customer.Phone)
+                {
+                    var existingPhone = await _context.Customer
+                        .AnyAsync(c => c.Phone == dto.Phone && c.Id != id);
+                    if (existingPhone)
+                        return Conflict(new { message = $"Khách hàng với số điện thoại '{dto.Phone}' đã tồn tại" });
+                }
+
+                // Check duplicate email (nếu email thay đổi)
+                if (!string.IsNullOrEmpty(dto.Email) && dto.Email != customer.Email)
+                {
+                    var existingEmail = await _context.Customer
+                        .AnyAsync(c => c.Email == dto.Email && c.Id != id);
+                    if (existingEmail)
+                        return Conflict(new { message = $"Khách hàng với email '{dto.Email}' đã tồn tại" });
+                }
+
+                // Update
+                customer.FullName = dto.FullName.Trim();
+                customer.Phone = string.IsNullOrEmpty(dto.Phone) ? null : dto.Phone.Trim();
+                customer.Email = string.IsNullOrEmpty(dto.Email) ? null : dto.Email.Trim();
+                customer.UpdatedAt = DateTime.UtcNow;
+
+                _context.Entry(customer).State = EntityState.Modified;
+                await _context.SaveChangesAsync();
+
+                _logger.LogInformation($"Updated customer: {id} - {customer.FullName}");
+
+                return NoContent();
+            }
+            catch (DbUpdateConcurrencyException)
+            {
+                if (!await CustomerExistsAsync(id))
+                    return NotFound(new { message = $"Không tìm thấy khách hàng với Id = {id}" });
+
+                _logger.LogError($"Concurrency error updating customer {id}");
+                return StatusCode(500, new { message = "Lỗi concurrency, vui lòng thử lại" });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Error updating customer {id}");
+                return StatusCode(500, new { message = "Lỗi khi cập nhật khách hàng", error = ex.Message });
+            }
+        }
+
+        // ============================================
+        // 🔹 DELETE: Xóa customer
+        // ============================================
+        /// <summary>
+        /// DELETE: Xóa khách hàng
+        /// </summary>
+        [Authorize(Roles = "Admin")]
+        [HttpDelete("{id}")]
+        [ProducesResponseType(StatusCodes.Status204NoContent)]
+        [ProducesResponseType(StatusCodes.Status404NotFound)]
+        [ProducesResponseType(StatusCodes.Status400BadRequest)]
+        public async Task<IActionResult> DeleteCustomer(int id)
+        {
+            try
+            {
+                var customer = await _context.Customer
+                    .Include(c => c.Orders)
+                    .Include(c => c.Reservations)
+                    .FirstOrDefaultAsync(c => c.Id == id);
+
+                if (customer == null)
+                    return NotFound(new { message = $"Không tìm thấy khách hàng với Id = {id}" });
+
+                // Check if customer has orders
+                if (customer.Orders.Any())
+                    return BadRequest(new { message = "Không thể xóa khách hàng có đơn hàng" });
+
+                // Check if customer has reservations
+                if (customer.Reservations.Any())
+                    return BadRequest(new { message = "Không thể xóa khách hàng có lịch đặt bàn" });
+
+                _context.Customer.Remove(customer);
+                await _context.SaveChangesAsync();
+
+                _logger.LogInformation($"Deleted customer: {id}");
+
+                return NoContent();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Error deleting customer {id}");
+                return StatusCode(500, new { message = "Lỗi khi xóa khách hàng", error = ex.Message });
+            }
+        }
+
+        // ============================================
+        // 🔹 GET: Lấy orders của customer
+        // ============================================
+        /// <summary>
+        /// GET: Lấy danh sách orders của khách hàng
+        /// </summary>
+        [HttpGet("{id}/orders")]
+        [ProducesResponseType(typeof(List<CustomerOrderDTO>), StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status404NotFound)]
+        public async Task<ActionResult<List<CustomerOrderDTO>>> GetCustomerOrders(int id)
+        {
+            try
+            {
+                var customer = await _context.Customer
+                    .Include(c => c.Orders)
+                    .FirstOrDefaultAsync(c => c.Id == id);
+
+                if (customer == null)
+                    return NotFound(new { message = $"Không tìm thấy khách hàng với Id = {id}" });
+
+                var orders = customer.Orders
+                    .OrderByDescending(o => o.OrderTime)
+                    .Select(o => new CustomerOrderDTO
+                    {
+                        Id = o.Id,
+                        OrderNumber = o.OrderNumber,
+                        TotalAmount = o.TotalAmount,
+                        Status = o.Status,
+                        OrderTime = o.OrderTime
+                    })
+                    .ToList();
+
+                return Ok(orders);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Error getting orders for customer {id}");
+                return StatusCode(500, new { message = "Lỗi khi lấy danh sách orders", error = ex.Message });
+            }
+        }
+
+        // ============================================
+        // 🔹 GET: Lấy reservations của customer
+        // ============================================
+        /// <summary>
+        /// GET: Lấy danh sách reservations của khách hàng
+        /// </summary>
+        [HttpGet("{id}/reservations")]
+        [ProducesResponseType(typeof(List<CustomerReservationDTO>), StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status404NotFound)]
+        public async Task<ActionResult<List<CustomerReservationDTO>>> GetCustomerReservations(int id)
+        {
+            try
+            {
+                var customer = await _context.Customer
+                    .Include(c => c.Reservations)
+                    .FirstOrDefaultAsync(c => c.Id == id);
+
+                if (customer == null)
+                    return NotFound(new { message = $"Không tìm thấy khách hàng với Id = {id}" });
+
+                var reservations = customer.Reservations
+                    .OrderByDescending(r => r.ReservationTime)
+                    .Select(r => new CustomerReservationDTO
+                    {
+                        Id = r.Id,
+                        ReservationNumber = r.ReservationNumber,
+                        ReservationTime = r.ReservationTime,
+                        Status = r.Status,
+                        NumberOfGuests = r.NumberOfGuests
+                    })
+                    .ToList();
+
+                return Ok(reservations);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Error getting reservations for customer {id}");
+                return StatusCode(500, new { message = "Lỗi khi lấy danh sách reservations", error = ex.Message });
+            }
+        }
+
+        // ============================================
+        // 🔹 GET: Thống kê customer
+        // ============================================
+        /// <summary>
+        /// GET: Lấy thống kê các khách hàng
+        /// </summary>
+        [HttpGet("statistics/overview")]
+        [ProducesResponseType(typeof(object), StatusCodes.Status200OK)]
+        public async Task<ActionResult<object>> GetStatistics()
+        {
+            try
+            {
+                var totalCustomers = await _context.Customer.CountAsync();
+                var customersWithOrders = await _context.Customer
+                    .Where(c => c.Orders.Any())
+                    .CountAsync();
+                var customersWithReservations = await _context.Customer
+                    .Where(c => c.Reservations.Any())
+                    .CountAsync();
+                var totalSpent = await _context.Orders
+                    .SumAsync(o => o.TotalAmount);
+                var recentCustomers = await _context.Customer
+                    .OrderByDescending(c => c.CreatedAt)
+                    .Take(5)
+                    .Select(c => new { c.Id, c.FullName, c.Phone, c.CreatedAt })
+                    .ToListAsync();
+
+                return Ok(new
+                {
+                    totalCustomers,
+                    customersWithOrders,
+                    customersWithReservations,
+                    totalSpent = Math.Round(totalSpent, 2),
+                    recentCustomers
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error getting statistics");
+                return StatusCode(500, new { message = "Lỗi khi lấy thống kê", error = ex.Message });
+            }
+        }
+
+        // ============================================
+        // 🔹 Helper Methods
+        // ============================================
+
+        private CustomerDTO MapToDTO(Customer customer)
+        {
+            return new CustomerDTO
+            {
+                Id = customer.Id,
+                FullName = customer.FullName,
+                Phone = customer.Phone,
+                Email = customer.Email,
+                CreatedAt = customer.CreatedAt,
+                UpdatedAt = customer.UpdatedAt,
+                TotalOrders = customer.Orders?.Count ?? 0,
+                TotalReservations = customer.Reservations?.Count ?? 0,
+                TotalSpent = customer.Orders?.Sum(o => o.TotalAmount) ?? 0
+            };
+        }
+
+        private CustomerDetailDTO MapToDetailDTO(Customer customer)
+        {
+            return new CustomerDetailDTO
+            {
+                Id = customer.Id,
+                FullName = customer.FullName,
+                Phone = customer.Phone,
+                Email = customer.Email,
+                CreatedAt = customer.CreatedAt,
+                UpdatedAt = customer.UpdatedAt,
+                TotalOrders = customer.Orders?.Count ?? 0,
+                TotalReservations = customer.Reservations?.Count ?? 0,
+                TotalSpent = customer.Orders?.Sum(o => o.TotalAmount) ?? 0,
+                Orders = customer.Orders?.Select(o => new CustomerOrderDTO
+                {
+                    Id = o.Id,
+                    OrderNumber = o.OrderNumber,
+                    TotalAmount = o.TotalAmount,
+                    Status = o.Status,
+                    OrderTime = o.OrderTime
+                }).OrderByDescending(o => o.OrderTime).ToList() ?? new(),
+                Reservations = customer.Reservations?.Select(r => new CustomerReservationDTO
+                {
+                    Id = r.Id,
+                    ReservationNumber = r.ReservationNumber,
+                    ReservationTime = r.ReservationTime,
+                    Status = r.Status,
+                    NumberOfGuests = r.NumberOfGuests
+                }).OrderByDescending(r => r.ReservationTime).ToList() ?? new()
+            };
+        }
+
+        private async Task<bool> CustomerExistsAsync(int id)
+        {
+            return await _context.Customer.AnyAsync(e => e.Id == id);
+        }
+    }
+}

@@ -1,0 +1,713 @@
+﻿using Microsoft.EntityFrameworkCore;
+using Restaurant_Management.Models.Entities;
+using RestaurantManagement.Models;
+
+namespace Restaurant_Management.Data
+{
+    public class RestaurantDbContext : DbContext
+    {
+        public RestaurantDbContext(DbContextOptions<RestaurantDbContext> options) : base(options)
+        {
+        }
+
+        // DbSets
+        public DbSet<User> Users { get; set; }
+        public DbSet<Category> Categories { get; set; }
+        public DbSet<MenuItem> MenuItems { get; set; }
+        public DbSet<Table> Tables { get; set; }
+        public DbSet<Order> Orders { get; set; }
+        public DbSet<OrderDetail> OrderDetails { get; set; }
+        public DbSet<Invoice> Invoices { get; set; }
+        public DbSet<OrderTable> OrderTables { get; set; }   // bảng trung gian Order – Table
+        public DbSet<Setting> Settings { get; set; }
+        public DbSet<AuditLog> AuditLogs { get; set; }
+        public DbSet<RefreshToken> RefreshTokens { get; set; }
+        public DbSet<HistoryLog> HistoryLogs { get; set; }
+        public DbSet<ReportCache> ReportCaches { get; set; }
+        public DbSet<Notification> Notifications { get; set; }
+        public DbSet<Reservation> Reservations { get; set; }
+        public DbSet<ReservationTable> ReservationTables { get; set; }
+        public DbSet<Promotion> Promotions { get; set; }
+        public DbSet<PromotionUsage> PromotionUsages { get; set; }
+        public DbSet<AIChatConversation> AIChatConversations { get; set; }
+        public DbSet<AIChatMessage> AIChatMessages { get; set; }
+        public DbSet<AIChatActionLog> AIChatActionLogs { get; set; }
+        public DbSet<Expense> Expenses { get; set; }
+
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            base.OnModelCreating(modelBuilder);
+
+            // ========== MenuItem ==========
+            modelBuilder.Entity<MenuItem>()
+                .HasOne(m => m.Category)
+                .WithMany(c => c.MenuItems)
+                .HasForeignKey(m => m.CategoryId)
+                .OnDelete(DeleteBehavior.Restrict);
+
+            // ========== Order – Staff ==========
+            modelBuilder.Entity<Order>()
+                .HasOne(o => o.Staff)
+                .WithMany(u => u.Orders)
+                .HasForeignKey(o => o.StaffId)
+                .OnDelete(DeleteBehavior.Restrict);
+
+            // ========== Order – Customer ==========
+            modelBuilder.Entity<Order>()
+                .HasOne(o => o.Customer)
+                .WithMany(c => c.Orders)
+                .HasForeignKey(o => o.CustomerId)
+                .OnDelete(DeleteBehavior.SetNull);
+
+            // ========== OrderDetail ==========
+            modelBuilder.Entity<OrderDetail>()
+                .HasOne(od => od.Order)
+                .WithMany(o => o.OrderDetails)
+                .HasForeignKey(od => od.OrderId)
+                .OnDelete(DeleteBehavior.Cascade);
+
+            modelBuilder.Entity<OrderDetail>()
+                .HasOne(od => od.MenuItem)
+                .WithMany(m => m.OrderDetails)
+                .HasForeignKey(od => od.MenuItemId)
+                .OnDelete(DeleteBehavior.Restrict);
+
+            // ========== Invoice ==========
+            modelBuilder.Entity<Invoice>()
+                .HasOne(p => p.Order)
+                .WithMany(o => o.Invoices)
+                .HasForeignKey(p => p.OrderId)
+                .OnDelete(DeleteBehavior.Cascade);
+
+            modelBuilder.Entity<Invoice>()
+                .HasOne(p => p.CreatedByUser)
+                .WithMany()
+                .HasForeignKey(p => p.CreatedBy)
+                .OnDelete(DeleteBehavior.Restrict);
+           
+            modelBuilder.Entity<Invoice>(entity =>
+            {
+                entity.ToTable("Invoices");
+                entity.HasKey(e => e.Id);
+
+                // Cho phép PromotionCode null
+                entity.Property(e => e.PromotionCode)
+                    .IsRequired(false)
+                    .HasMaxLength(20);
+
+                // Cho phép PromotionId null
+                entity.Property(e => e.PromotionId)
+                    .IsRequired(false);
+
+                entity.Property(e => e.PromotionDiscount)
+                    .HasColumnType("decimal(10,2)")                    
+                    .HasDefaultValue(0m);
+
+                entity.Property(e => e.PaymentMethod)
+                    .IsRequired()
+                    .HasMaxLength(30)
+                    .HasDefaultValue("Cash");
+
+                entity.Property(e => e.Status)
+                    .IsRequired()
+                    .HasMaxLength(20)
+                    .HasDefaultValue("Pending");
+
+                entity.Property(e => e.CreatedAt)
+                    .HasDefaultValueSql("GETDATE()");
+
+                entity.Property(e => e.UpdatedAt)
+                    .HasDefaultValueSql("GETDATE()");
+
+               
+            });
+
+
+            // ========== Order – Table (Many-to-Many) ==========
+            modelBuilder.Entity<OrderTable>()
+                .HasKey(ot => ot.Id);
+          
+            modelBuilder.Entity<OrderTable>()
+                .HasIndex(ot => new { ot.OrderId, ot.TableId })
+                .IsUnique();
+
+            
+
+
+            modelBuilder.Entity<User>(entity =>
+            {
+                entity.HasKey(e => e.Id);
+
+                entity.HasIndex(e => e.Username)
+                    .IsUnique()
+                    .HasDatabaseName("IX_Users_Username");
+
+                entity.HasIndex(e => e.Email)
+                    .IsUnique()
+                    .HasDatabaseName("IX_Users_Email")
+                    .HasFilter("[Email] IS NOT NULL");
+
+                entity.Property(e => e.Role)
+                    .HasConversion<int>(); // Lưu enum dưới dạng int
+
+                entity.Property(e => e.CreatedAt)
+                    .HasDefaultValueSql("GETUTCDATE()");
+
+                entity.Property(e => e.UpdatedAt)
+                    .HasDefaultValueSql("GETUTCDATE()");
+
+                entity.Property(u => u.Phone)
+                    .HasMaxLength(20);
+
+                entity.Property(u => u.ResetToken)
+                    .HasMaxLength(255);
+
+                entity.Property(u => u.IsActive)
+                    .HasDefaultValue(true);
+
+                entity.Property(u => u.IsLocked)
+                    .HasDefaultValue(false);
+
+                entity.Property(u => u.FailedLoginAttempts)
+                    .HasDefaultValue(0);
+            });
+      
+            modelBuilder.Entity<AuditLog>(entity =>
+            {
+                entity.HasKey(e => e.Id);
+
+                entity.HasIndex(e => e.UserId);
+                entity.HasIndex(e => e.Timestamp);
+
+                entity.HasOne(e => e.User)
+                    .WithMany()
+                    .HasForeignKey(e => e.UserId)
+                    .OnDelete(DeleteBehavior.Cascade);
+            });
+
+            modelBuilder.Entity<Notification>()
+           .Property(n => n.Payload)
+           .HasColumnType("nvarchar(max)");
+
+
+            modelBuilder.Entity<RefreshToken>(entity =>
+            {
+                // Tên bảng
+                entity.ToTable("RefreshTokens");
+
+                // Primary Key
+                entity.HasKey(rt => rt.Id);
+
+                // ✅ Cấu hình columns
+                entity.Property(rt => rt.Token)
+                    .IsRequired()
+                    .HasMaxLength(500);
+
+                entity.Property(rt => rt.ExpiresAt)
+                    .IsRequired();
+
+                entity.Property(rt => rt.CreatedAt)
+                    .IsRequired()
+                    .HasDefaultValueSql("GETUTCDATE()"); // Auto set on insert
+
+                entity.Property(rt => rt.LastUsedAt)
+                   .IsRequired()
+                   .HasDefaultValueSql("GETUTCDATE()");
+
+
+                entity.Property(rt => rt.IsRevoked)
+                    .IsRequired()
+                    .HasDefaultValue(false);
+
+                entity.Property(rt => rt.RevokedAt)
+                    .IsRequired(false); // Nullable
+
+                entity.Property(rt => rt.RevokeReason)
+                    .HasMaxLength(200)
+                    .IsRequired(false);
+
+                entity.Property(rt => rt.IpAddress)
+                    .HasMaxLength(50)
+                    .IsRequired(false);
+
+                entity.Property(rt => rt.UserAgent)
+                    .HasMaxLength(500)
+                    .IsRequired(false);
+
+                entity.Property(rt => rt.DeviceFingerprint)
+                    .HasMaxLength(200)
+                    .IsRequired();
+
+                entity.Property(rt => rt.DeviceName)
+                    .HasMaxLength(100)
+                    .IsRequired();
+
+                entity.Ignore(rt => rt.IsValid);
+
+                entity.HasOne(rt => rt.User)
+                .WithMany(u => u.RefreshTokens)  
+                .HasForeignKey(rt => rt.UserId)
+                .OnDelete(DeleteBehavior.Cascade);
+
+                entity.HasIndex(rt => rt.Token)
+                    .IsUnique()
+                    .HasDatabaseName("IX_RefreshTokens_Token");
+               
+                entity.HasIndex(rt => rt.UserId)
+                    .HasDatabaseName("IX_RefreshTokens_UserId");
+
+                entity.HasIndex(rt => rt.DeviceFingerprint)
+                    .HasDatabaseName("IX_RefreshTokens_DeviceFingerprint");
+
+                entity.HasIndex(rt => new { rt.UserId, rt.IsRevoked, rt.ExpiresAt })
+                    .HasDatabaseName("IX_RefreshTokens_UserId_IsRevoked_ExpiresAt");
+            });
+
+            // ========== HistoryLog ==========
+            modelBuilder.Entity<HistoryLog>(entity =>
+            {
+                entity.HasKey(h => h.Id);
+
+                entity.Property(h => h.Entity)
+                    .HasMaxLength(50)
+                    .IsRequired();
+
+                entity.Property(h => h.Action)
+                    .HasMaxLength(50)
+                    .IsRequired();
+
+                entity.Property(h => h.OldData)
+                    .HasColumnType("nvarchar(max)");
+
+                entity.Property(h => h.NewData)
+                    .HasColumnType("nvarchar(max)");
+
+                entity.HasIndex(h => new { h.Entity, h.EntityId })
+                    .HasDatabaseName("IX_HistoryLog_Entity_EntityId");
+
+                entity.HasIndex(h => h.UserId)
+                    .HasDatabaseName("IX_HistoryLog_UserId");
+
+                entity.HasIndex(h => h.CreatedAt)
+                    .HasDatabaseName("IX_HistoryLog_CreatedAt");
+
+                entity.HasOne<User>()
+                    .WithMany()
+                    .HasForeignKey(h => h.UserId)
+                    .OnDelete(DeleteBehavior.SetNull);
+            });
+
+
+            // ========== ReportCache ==========
+            modelBuilder.Entity<ReportCache>(entity =>
+            {
+                entity.HasKey(r => r.Id);
+
+                entity.Property(r => r.ReportType)
+                    .HasMaxLength(50)
+                    .IsRequired();
+
+                entity.Property(r => r.DataJson)
+                    .HasColumnType("nvarchar(max)")
+                    .IsRequired();
+
+                entity.HasIndex(r => r.ReportDate)
+                    .HasDatabaseName("IX_ReportCache_ReportDate");
+
+                entity.HasIndex(r => new { r.ReportType, r.ReportDate })
+                    .IsUnique()
+                    .HasDatabaseName("UQ_ReportCache_Type_Date");
+            });
+
+
+            // ========== Notification ==========
+            modelBuilder.Entity<Notification>(entity =>
+            {
+                entity.HasKey(n => n.Id);
+
+                entity.Property(n => n.Type)
+                    .HasMaxLength(50)
+                    .IsRequired();
+
+                entity.Property(n => n.TargetRole)
+                    .HasMaxLength(20)
+                    .IsRequired();
+
+                entity.Property(n => n.Message)
+                    .HasMaxLength(500)
+                    .IsRequired();
+
+                entity.Property(n => n.Payload)
+                    .HasColumnType("nvarchar(max)");
+
+                entity.HasIndex(n => n.TargetRole)
+                    .HasDatabaseName("IX_Notification_TargetRole");
+
+                entity.HasIndex(n => n.OrderId)
+                    .HasDatabaseName("IX_Notification_OrderId");
+
+                entity.HasIndex(n => n.TableId)
+                    .HasDatabaseName("IX_Notification_TableId");
+
+                entity.HasIndex(n => n.IsRead)
+                    .HasDatabaseName("IX_Notification_IsRead");
+
+                entity.HasIndex(n => n.CreatedAt)
+                    .HasDatabaseName("IX_Notification_CreatedAt");
+
+                entity.HasOne<User>()
+                    .WithMany()
+                    .HasForeignKey(n => n.ReadBy)
+                    .OnDelete(DeleteBehavior.SetNull);
+
+                modelBuilder.Entity<Reservation>(entity =>
+                {
+                    entity.ToTable("Reservations");
+                    entity.HasKey(e => e.Id);
+
+                    // ✅ THÊM: Unique constraint cho ReservationNumber
+                    entity.HasIndex(e => e.ReservationNumber)
+                        .IsUnique()
+                        .HasDatabaseName("UQ_Reservations_ReservationNumber");
+
+                    // Indexes for performance
+                    entity.HasIndex(e => e.CustomerPhone)
+                        .HasDatabaseName("IX_Reservations_CustomerPhone");
+
+                    entity.HasIndex(e => e.ReservationTime)
+                        .HasDatabaseName("IX_Reservations_ReservationTime");
+
+                    entity.HasIndex(e => e.Status)
+                        .HasDatabaseName("IX_Reservations_Status");
+
+                    entity.HasIndex(e => e.CreatedBy)
+                        .HasDatabaseName("IX_Reservations_CreatedBy");
+
+                    entity.HasIndex(e => e.OrderId)
+                        .HasDatabaseName("IX_Reservations_OrderId");
+
+                    // Composite index for common queries
+                    entity.HasIndex(e => new { e.ReservationTime, e.Status })
+                        .HasDatabaseName("IX_Reservations_ReservationTime_Status");
+
+                    // ✅ THÊM: Index cho PreferredArea
+                    entity.HasIndex(e => e.PreferredArea)
+                        .HasDatabaseName("IX_Reservations_PreferredArea");
+
+                    // Default values
+                    entity.Property(e => e.Status)
+                        .HasDefaultValue("Pending");
+
+                    entity.Property(e => e.CreatedAt)
+                        .HasDefaultValueSql("GETDATE()");
+
+                    entity.Property(e => e.UpdatedAt)
+                        .HasDefaultValueSql("GETDATE()");
+
+                    // Relationships
+                    entity.HasOne(e => e.User)
+                        .WithMany()
+                        .HasForeignKey(e => e.CreatedBy)
+                        .OnDelete(DeleteBehavior.SetNull);
+
+                    entity.HasOne(e => e.Order)
+                        .WithMany()
+                        .HasForeignKey(e => e.OrderId)
+                        .OnDelete(DeleteBehavior.SetNull);
+
+                });
+                modelBuilder.Entity<Reservation>()
+                  .HasOne(r => r.Customer)
+                  .WithMany(c => c.Reservations)
+                  .HasForeignKey(r => r.CustomerId)
+                  .OnDelete(DeleteBehavior.SetNull);
+
+                // ========== ReservationTable (Composite Key) ==========
+                modelBuilder.Entity<ReservationTable>(entity =>
+                {
+                    entity.ToTable("ReservationTables");
+                   
+                    entity.HasKey(e => new { e.ReservationId, e.TableId });
+                   
+                    entity.HasIndex(e => e.TableId)
+                        .HasDatabaseName("IX_ReservationTables_TableId");
+
+                   
+                    entity.HasIndex(e => new { e.ReservationId, e.SortOrder })
+                        .HasDatabaseName("IX_ReservationTables_ReservationId_SortOrder");
+
+                    // Relationships
+                    entity.HasOne(e => e.Reservation)
+                        .WithMany(r => r.ReservationTables)
+                        .HasForeignKey(e => e.ReservationId)
+                        .OnDelete(DeleteBehavior.Cascade);
+
+                    entity.HasOne(e => e.Table)
+                        .WithMany()
+                        .HasForeignKey(e => e.TableId)
+                        .OnDelete(DeleteBehavior.Restrict); 
+                });
+                modelBuilder.Entity<Promotion>(entity =>
+                {
+                    entity.ToTable("Promotions");
+
+                    entity.HasKey(e => e.Id);
+
+                    // Unique constraint cho Code
+                    entity.HasIndex(e => e.Code)
+                        .IsUnique()
+                        .HasDatabaseName("IX_Promotions_Code_Unique");
+
+                    // Indexes cho performance
+                    entity.HasIndex(e => e.Code)
+                        .HasDatabaseName("IX_Promotions_Code");
+
+                    entity.HasIndex(e => new { e.StartDate, e.EndDate })
+                        .HasDatabaseName("IX_Promotions_DateRange");
+
+                    entity.HasIndex(e => e.Active)
+                        .HasDatabaseName("IX_Promotions_Active");
+
+                    // Composite index cho query thường dùng
+                    entity.HasIndex(e => new { e.Active, e.StartDate, e.EndDate })
+                        .HasDatabaseName("IX_Promotions_Active_Dates");
+
+                    // Default values
+                    entity.Property(e => e.MinOrderAmount)
+                        .HasDefaultValue(0);
+
+                    entity.Property(e => e.UsageCount)
+                        .HasDefaultValue(0);
+
+                    entity.Property(e => e.Active)
+                        .HasDefaultValue(true);
+
+                    entity.Property(e => e.CreatedAt)
+                        .HasDefaultValueSql("GETDATE()");
+
+                    entity.Property(e => e.UpdatedAt)
+                        .HasDefaultValueSql("GETDATE()");
+
+                });
+                
+                modelBuilder.Entity<PromotionUsage>(entity =>
+                {
+                    entity.ToTable("PromotionUsages");
+
+                    entity.HasKey(e => e.Id);
+
+                    // Indexes để query nhanh
+                    entity.HasIndex(e => new { e.CustomerId, e.PromotionId })
+                        .HasDatabaseName("IX_PromotionUsages_Customer");
+
+                    entity.HasIndex(e => new { e.CustomerPhone, e.PromotionId })
+                        .HasDatabaseName("IX_PromotionUsages_Phone");
+
+                    entity.HasIndex(e => e.PromotionId)
+                        .HasDatabaseName("IX_PromotionUsages_PromotionId");
+
+                    entity.HasIndex(e => e.InvoiceId)
+                        .HasDatabaseName("IX_PromotionUsages_InvoiceId");
+
+                    entity.HasIndex(e => e.UsedAt)
+                        .HasDatabaseName("IX_PromotionUsages_UsedAt");
+
+                    // Default value
+                    entity.Property(e => e.UsedAt)
+                        .HasDefaultValueSql("GETDATE()");
+
+                    // Relationships
+                    entity.HasOne(e => e.Promotion)
+                        .WithMany(p => p.PromotionUsages)
+                        .HasForeignKey(e => e.PromotionId)
+                        .OnDelete(DeleteBehavior.Cascade);
+
+                    entity.HasOne(e => e.Invoice)
+                        .WithMany(i => i.PromotionUsages)
+                        .HasForeignKey(e => e.InvoiceId)
+                        .OnDelete(DeleteBehavior.Cascade);
+
+                    entity.HasOne(e => e.Customer)
+                        .WithMany()
+                        .HasForeignKey(e => e.CustomerId)
+                        .OnDelete(DeleteBehavior.SetNull);
+
+                });
+                modelBuilder.Entity<AIChatConversation>(entity =>
+                {
+                    entity.ToTable("AIChatConversation");
+
+                    entity.HasKey(e => e.Id);
+
+                    entity.Property(e => e.SessionId)
+                        .IsRequired()
+                        .HasMaxLength(100);
+
+                    entity.Property(e => e.Topic)
+                        .HasMaxLength(100);
+
+                    entity.Property(e => e.IsActive)
+                        .IsRequired()
+                        .HasDefaultValue(true);
+
+                    entity.Property(e => e.StartedAt)
+                        .IsRequired()
+                        .HasDefaultValueSql("GETDATE()");
+
+                    entity.Property(e => e.LastMessageAt)
+                        .IsRequired()
+                        .HasDefaultValueSql("GETDATE()");
+
+                    entity.Property(e => e.IntentType)
+                        .HasMaxLength(50);
+
+                    // Relationships
+                    entity.HasOne(e => e.User)
+                        .WithMany()
+                        .HasForeignKey(e => e.UserId)
+                        .OnDelete(DeleteBehavior.SetNull);
+
+                    entity.HasMany(e => e.Messages)
+                        .WithOne(m => m.Conversation)
+                        .HasForeignKey(m => m.ConversationId)
+                        .OnDelete(DeleteBehavior.Cascade);
+
+                    entity.HasMany(e => e.ActionLogs)
+                        .WithOne(a => a.Conversation)
+                        .HasForeignKey(a => a.ConversationId)
+                        .OnDelete(DeleteBehavior.Cascade);
+
+                    // Indexes
+                    entity.HasIndex(e => e.SessionId);
+                    entity.HasIndex(e => e.UserId);
+                    entity.HasIndex(e => e.IsActive);
+                    entity.HasIndex(e => e.LastMessageAt);
+                });
+
+                // AIChatMessage Configuration
+                modelBuilder.Entity<AIChatMessage>(entity =>
+                {
+                    entity.ToTable("AIChatMessage");
+
+                    entity.HasKey(e => e.Id);
+
+                    entity.Property(e => e.Role)
+                        .IsRequired()
+                        .HasMaxLength(20);
+
+                    entity.Property(e => e.Content)
+                        .IsRequired()
+                        .HasColumnType("NVARCHAR(MAX)");
+
+                    entity.Property(e => e.Metadata)
+                        .HasColumnType("NVARCHAR(MAX)");
+
+                    entity.Property(e => e.CreatedAt)
+                        .IsRequired()
+                        .HasDefaultValueSql("GETDATE()");
+
+                    // Relationships
+                    entity.HasOne(e => e.Conversation)
+                        .WithMany(c => c.Messages)
+                        .HasForeignKey(e => e.ConversationId)
+                        .OnDelete(DeleteBehavior.Cascade);
+
+                    // Indexes
+                    entity.HasIndex(e => e.ConversationId);
+                    entity.HasIndex(e => e.CreatedAt);
+                });
+
+                // AIChatActionLog Configuration
+                modelBuilder.Entity<AIChatActionLog>(entity =>
+                {
+                    entity.ToTable("AIChatActionLog");
+
+                    entity.HasKey(e => e.Id);
+
+                    entity.Property(e => e.ActionType)
+                        .IsRequired()
+                        .HasMaxLength(50);
+
+                    entity.Property(e => e.EntityType)
+                        .HasMaxLength(50);
+
+                    entity.Property(e => e.ActionData)
+                        .HasColumnType("NVARCHAR(MAX)");
+
+                    entity.Property(e => e.Result)
+                        .HasColumnType("NVARCHAR(MAX)");
+
+                    entity.Property(e => e.CreatedAt)
+                        .IsRequired()
+                        .HasDefaultValueSql("GETDATE()");
+
+                    // Relationships
+                    entity.HasOne(e => e.Conversation)
+                        .WithMany(c => c.ActionLogs)
+                        .HasForeignKey(e => e.ConversationId)
+                        .OnDelete(DeleteBehavior.Cascade);
+
+                    // Indexes
+                    entity.HasIndex(e => e.ConversationId);
+                    entity.HasIndex(e => new { e.ActionType, e.CreatedAt })
+                        .HasDatabaseName("IX_ActionLog_Type");
+                    entity.HasIndex(e => new { e.EntityType, e.EntityId })
+                        .HasDatabaseName("IX_ActionLog_Entity");
+                });
+
+                modelBuilder.Entity<Expense>(entity =>
+                {
+                    entity.Property(x => x.Amount)
+                        .HasColumnType("decimal(12,2)");
+
+                    entity.Property(x => x.Category)
+                        .HasMaxLength(50)
+                        .IsRequired();
+
+                    entity.Property(x => x.PaymentMethod)
+                        .HasMaxLength(20)
+                        .IsRequired();
+
+                    entity.Property(x => x.InvoiceNumber)
+                        .HasMaxLength(50);
+
+                    entity.Property(x => x.Supplier)
+                        .HasMaxLength(100);
+
+                    entity.Property(x => x.TaxCode)
+                        .HasMaxLength(20);
+                }); 
+            });
+
+
+            // ========== Seed Data for Settings ==========
+
+            modelBuilder.Entity<Setting>().HasData(
+            new Setting { Id = 1, Key = "RestaurantName", Value = "Nhà hàng Việt Thái", Description = "Tên hiển thị hệ thống" },
+            new Setting { Id = 2, Key = "TaxRate", Value = "10", Description = "Thuế suất mặc định (%)" },
+            new Setting { Id = 3, Key = "Currency", Value = "VND" },
+            new Setting { Id = 4, Key = "AllowGuestOrder", Value = "true" }
+        );
+
+
+            // ========== Indexes ==========
+            modelBuilder.Entity<User>()
+                .HasIndex(u => u.Username)
+                .IsUnique();
+
+            modelBuilder.Entity<User>()
+                .HasIndex(u => u.Email)
+                .IsUnique();
+
+            modelBuilder.Entity<Table>()
+                .HasIndex(t => t.TableNumber)
+                .IsUnique();
+
+            modelBuilder.Entity<Order>()
+                .HasIndex(o => o.OrderNumber)
+                .IsUnique();
+        }
+        public DbSet<Restaurant_Management.Models.Entities.Customer> Customer { get; set; } = default!;
+    }
+}

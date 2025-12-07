@@ -1,0 +1,28 @@
+﻿using Restaurant_Management.Models.DTOs;
+using Restaurant_Management.Models.Entities;
+
+namespace Restaurant_Management.Helpers
+{
+    public static class MappingExtensions
+    {
+    public static InvoiceDTO ToDto(this Invoice invoice)
+        {
+            var customerName = invoice.Order?.Customer?.FullName ?? "Khách hàng";
+
+            return new InvoiceDTO
+            {
+                Id = invoice.Id,
+                OrderId = invoice.OrderId,
+                Amount = invoice.Amount,
+                Status = invoice.Status,
+                PaymentTime = invoice.PaymentTime,
+                CreatedBy = invoice.CreatedBy,
+                CreatedAt = invoice.CreatedAt,
+                UpdatedAt = invoice.UpdatedAt,
+                OrderNumber = invoice.Order?.OrderNumber,
+                CustomerName = customerName,
+                CreatedByName = invoice.CreatedByUser?.Username
+            };
+        }
+    }
+}

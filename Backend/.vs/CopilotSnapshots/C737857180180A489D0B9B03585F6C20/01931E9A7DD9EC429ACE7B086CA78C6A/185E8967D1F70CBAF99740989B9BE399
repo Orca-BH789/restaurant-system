@@ -1,0 +1,32 @@
+﻿namespace Restaurant_Management.Models.Entities
+{
+    public class Expense
+    {
+        public int Id { get; set; }
+        public int CreatedByUserId { get; set; }
+        public decimal Amount { get; set; }
+        public string Category { get; set; } = string.Empty;
+        public string? Description { get; set; }
+        public string? InvoiceNumber { get; set; }
+        public string? Supplier { get; set; }
+        public string PaymentMethod { get; set; } = "Cash";     // Cash, BankTransfer, Momo, ZaloPay, POS
+
+        public string? TaxCode { get; set; } // Mã số thuế NCC
+        public bool IsDeductible { get; set; } = true;
+        public ExpenseStatus Status { get; set; } = ExpenseStatus.Pending;
+
+        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+        public DateTime? UpdatedAt { get; set; }
+        public DateTime? DueDate { get; set; }
+        // Navigation
+        public User? CreatedByUser { get; set; }
+    }
+    public enum ExpenseStatus
+    {
+        Pending,  
+        Approved,  
+        Rejected,  
+        Paid       
+    }
+
+}

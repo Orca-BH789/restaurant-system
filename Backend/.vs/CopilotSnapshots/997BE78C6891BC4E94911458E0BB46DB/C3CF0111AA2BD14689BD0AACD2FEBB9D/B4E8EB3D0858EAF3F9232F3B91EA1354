@@ -1,0 +1,100 @@
+﻿using System.Text.RegularExpressions;
+
+namespace Restaurant_Management.Services.AI
+{
+    public class AIIntentDetectionService : IAIIntentDetectionService
+    {
+        public string DetectIntent(string message)
+        {
+            message = message.ToLower();
+
+            // Menu keywords
+            if (Regex.IsMatch(message, @"(gợi ý|suggest|recommend|món|dish|food|ăn gì|menu)"))
+                return "menu_suggestion";
+
+            // Promotion keywords
+            if (Regex.IsMatch(message, @"(khuyến mãi|promotion|giảm giá|discount|combo|voucher)"))
+                return "promotion_suggestion";
+
+            // Reservation keywords
+            if (Regex.IsMatch(message, @"(đặt bàn|book|reserve|reservation|table)"))
+                return "reservation";
+
+            // Analytics keywords
+            if (Regex.IsMatch(message, @"(doanh thu|revenue|thống kê|statistics|báo cáo|report|phân tích|analysis)"))
+                return "analytics";
+
+            return "general_inquiry";
+        }
+
+        public Dictionary<string, object> ExtractEntities(string message, string intent)
+        {
+            var entities = new Dictionary<string, object>();
+            message = message.ToLower();
+
+            switch (intent)
+            {
+                case "menu_suggestion":
+                    // Extract dietary preferences
+                    if (message.Contains("chay") || message.Contains("vegetarian"))
+                        entities["dietary"] = "vegetarian";
+                    if (message.Contains("hải sản") || message.Contains("seafood"))
+                        entities["category"] = "seafood";
+
+                    // Extract party size
+                    var partySizeMatch = Regex.Match(message, @"(\d+)\s*(người|people|person)");
+                    if (partySizeMatch.Success)
+                        entities["partySize"] = int.Parse(partySizeMatch.Groups[1].Value);
+
+                    // Extract budget
+                    var budgetMatch = Regex.Match(message, @"(\d+)k?");
+                    if (budgetMatch.Success)
+                        entities["budget"] = int.Parse(budgetMatch.Groups[1].Value) * 1000;
+
+                    break;
+
+                case "reservation":
+                    // Extract date/time
+                    if (message.Contains("hôm nay") || message.Contains("today"))
+                        entities["date"] = DateTime.Today;
+                    if (message.Contains("mai") || message.Contains("tomorrow"))
+                        entities["date"] = DateTime.Today.AddDays(1);
+
+                    // Extract time
+                    var timeMatch = Regex.Match(message, @"(\d+)\s*(giờ|h|pm|am)");
+                    if (timeMatch.Success)
+                    {
+                        var hour = int.Parse(timeMatch.Groups[1].Value);
+                        if (message.Contains("pm") || message.Contains("tối")) hour += 12;
+                        entities["time"] = new TimeSpan(hour, 0, 0);
+                    }
+
+                    // Extract party size
+                    var reservationPartySizeMatch = Regex.Match(message, @"(\d+)\s*(người|people)");
+                    if (reservationPartySizeMatch.Success)
+                        entities["partySize"] = int.Parse(reservationPartySizeMatch.Groups[1].Value);
+
+                    break;
+
+                case "analytics":
+                    // Extract time period
+                    if (message.Contains("hôm nay") || message.Contains("today"))
+                        entities["period"] = "today";
+                    if (message.Contains("tuần") || message.Contains("week"))
+                        entities["period"] = "week";
+                    if (message.Contains("tháng") || message.Contains("month"))
+                        entities["period"] = "month";
+
+                    // Extract query type
+                    if (message.Contains("doanh thu") || message.Contains("revenue"))
+                        entities["queryType"] = "revenue";
+                    if (message.Contains("món") || message.Contains("item"))
+                        entities["queryType"] = "popular_items";
+
+                    break;
+            }
+
+            return entities;
+        }
+    }
+}

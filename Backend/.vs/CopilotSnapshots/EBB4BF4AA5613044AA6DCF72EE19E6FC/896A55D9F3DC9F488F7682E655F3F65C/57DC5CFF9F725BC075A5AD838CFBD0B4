@@ -1,0 +1,159 @@
+﻿using Microsoft.EntityFrameworkCore.Migrations;
+
+#nullable disable
+
+namespace Restaurant_Management.Migrations
+{
+    /// <inheritdoc />
+    public partial class LinkOrdersToCustomersAndRemoveLegacyColumns : Migration
+    {
+        /// <inheritdoc />
+        protected override void Up(MigrationBuilder migrationBuilder)
+        {
+            // Step 1: Drop Foreign Key constraint if it exists (Order - Staff)
+            migrationBuilder.DropForeignKey(
+                name: "FK_Orders_Users_StaffId",
+                table: "Orders");
+
+            migrationBuilder.DropForeignKey(
+                name: "FK_Orders_Tables_TableId",
+                table: "Orders");
+
+            // Step 2: Drop existing indexes on Orders table that might be affected
+            migrationBuilder.DropIndex(
+                name: "IX_Orders_StaffId",
+                table: "Orders");
+
+            migrationBuilder.DropIndex(
+                name: "IX_Orders_TableId",
+                table: "Orders");
+
+            // Step 3: Remove old TableId column (no longer used, we use OrderTables instead)
+            migrationBuilder.DropColumn(
+                name: "TableId",
+                table: "Orders");
+
+            // Step 4: Add CustomerId Foreign Key column (if doesn't exist)
+            if (!migrationBuilder.ActiveProvider.Contains("SqlServer"))
+            {
+                migrationBuilder.AddColumn<int>(
+                    name: "CustomerId",
+                    table: "Orders",
+                    type: "int",
+                    nullable: true);
+            }
+
+            // Step 5: Create Foreign Key for Customer
+            migrationBuilder.CreateIndex(
+                name: "IX_Orders_CustomerId",
+                table: "Orders",
+                column: "CustomerId");
+
+            migrationBuilder.AddForeignKey(
+                name: "FK_Orders_Customers_CustomerId",
+                table: "Orders",
+                column: "CustomerId",
+                principalTable: "Customer",
+                principalColumn: "Id",
+                onDelete: ReferentialAction.SetNull);
+
+            // Step 6: Recreate Staff Foreign Key
+            migrationBuilder.CreateIndex(
+                name: "IX_Orders_StaffId",
+                table: "Orders",
+                column: "StaffId");
+
+            migrationBuilder.AddForeignKey(
+                name: "FK_Orders_Users_StaffId",
+                table: "Orders",
+                column: "StaffId",
+                principalTable: "Users",
+                principalColumn: "Id",
+                onDelete: ReferentialAction.Restrict);
+
+            // Step 7: Drop legacy columns (CustomerName, CustomerPhone)
+            // These should already be migrated by the SQL script you provided
+            migrationBuilder.DropColumn(
+                name: "CustomerName",
+                table: "Orders");
+
+            migrationBuilder.DropColumn(
+                name: "CustomerPhone",
+                table: "Orders");
+        }
+
+        /// <inheritdoc />
+        protected override void Down(MigrationBuilder migrationBuilder)
+        {
+            // Rollback: Recreate the legacy columns
+            migrationBuilder.AddColumn<string>(
+                name: "CustomerName",
+                table: "Orders",
+                type: "nvarchar(100)",
+                maxLength: 100,
+                nullable: true);
+
+            migrationBuilder.AddColumn<string>(
+                name: "CustomerPhone",
+                table: "Orders",
+                type: "nvarchar(15)",
+                maxLength: 15,
+                nullable: true);
+
+            // Rollback: Drop Customer Foreign Key
+            migrationBuilder.DropForeignKey(
+                name: "FK_Orders_Customers_CustomerId",
+                table: "Orders");
+
+            migrationBuilder.DropIndex(
+                name: "IX_Orders_CustomerId",
+                table: "Orders");
+
+            migrationBuilder.DropColumn(
+                name: "CustomerId",
+                table: "Orders");
+
+            // Rollback: Recreate Staff Foreign Key with correct index names
+            migrationBuilder.DropForeignKey(
+                name: "FK_Orders_Users_StaffId",
+                table: "Orders");
+
+            migrationBuilder.DropIndex(
+                name: "IX_Orders_StaffId",
+                table: "Orders");
+
+            // Rollback: Recreate TableId column
+            migrationBuilder.AddColumn<int>(
+                name: "TableId",
+                table: "Orders",
+                type: "int",
+                nullable: true);
+
+            migrationBuilder.CreateIndex(
+                name: "IX_Orders_StaffId",
+                table: "Orders",
+                column: "StaffId");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_Orders_TableId",
+                table: "Orders",
+                column: "TableId");
+
+            migrationBuilder.AddForeignKey(
+                name: "FK_Orders_Users_StaffId",
+                table: "Orders",
+                column: "StaffId",
+                principalTable: "Users",
+                principalColumn: "Id",
+                onDelete: ReferentialAction.Restrict);
+
+            migrationBuilder.AddForeignKey(
+                name: "FK_Orders_Tables_TableId",
+                table: "Orders",
+                column: "TableId",
+                principalTable: "Tables",
+                principalColumn: "Id",
+                onDelete: ReferentialAction.SetNull);
+        }
+    }
+}

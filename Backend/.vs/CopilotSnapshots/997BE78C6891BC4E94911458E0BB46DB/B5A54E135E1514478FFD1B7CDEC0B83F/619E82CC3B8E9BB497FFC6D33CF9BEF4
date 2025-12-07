@@ -1,0 +1,533 @@
+﻿using Microsoft.EntityFrameworkCore;
+using Restaurant_Management.Data;
+using Restaurant_Management.Models.DTO.AI.RestaurantManagement.DTOs.AI;
+using Restaurant_Management.Models.Entities;
+using RestaurantManagement.Models;
+using System.Text.Json;
+
+
+namespace Restaurant_Management.Services.AI
+{
+    public class AIChatService : IAIChatService
+    {
+        private readonly RestaurantDbContext _context;
+        private readonly IAIIntentDetectionService _intentService;
+        private readonly IAIAnalyticsService _analyticsService;
+
+        public AIChatService(
+            RestaurantDbContext context,
+            IAIIntentDetectionService intentService,
+            IAIAnalyticsService analyticsService)
+        {
+            _context = context;
+            _intentService = intentService;
+            _analyticsService = analyticsService;
+        }
+
+        public async Task<SendMessageResponse> SendMessageAsync(SendMessageRequest request, int? userId = null)
+        {
+            // Get or create conversation
+            AIChatConversation conversation;
+
+            if (!string.IsNullOrEmpty(request.SessionId))
+            {
+                conversation = await _context.AIChatConversations
+                    .FirstOrDefaultAsync(c => c.SessionId == request.SessionId && c.IsActive);
+
+                if (conversation == null)
+                    throw new Exception("Conversation not found");
+            }
+            else
+            {
+                conversation = new AIChatConversation
+                {
+                    UserId = userId,
+                    SessionId = Guid.NewGuid().ToString(),
+                    IsActive = true,
+                    StartedAt = DateTime.UtcNow,
+                    LastMessageAt = DateTime.UtcNow
+                };
+                await _context.AIChatConversations.AddAsync(conversation);
+                await _context.SaveChangesAsync();
+            }
+
+            // Save user message
+            await SaveMessageAsync(conversation.Id, "user", request.Message);
+
+            // Detect intent
+            var intent = _intentService.DetectIntent(request.Message);
+            var entities = _intentService.ExtractEntities(request.Message, intent);
+
+            // Update conversation intent
+            conversation.IntentType = intent;
+            conversation.LastMessageAt = DateTime.UtcNow;
+
+            string response;
+            object data = null;
+
+            // Handle based on intent
+            switch (intent)
+            {
+                case "menu_suggestion":
+                    var menuSuggestions = await SuggestMenuItemsAsync(request.Message, userId, conversation.Id);
+                    response = GenerateMenuResponse(menuSuggestions);
+                    data = menuSuggestions;
+                    break;
+
+                case "promotion_suggestion":
+                    var promotionSuggestions = await SuggestPromotionsAsync(request.Message, conversation.Id);
+                    response = GeneratePromotionResponse(promotionSuggestions);
+                    data = promotionSuggestions;
+                    break;
+
+                case "reservation":
+                    var reservationSuggestion = await SuggestReservationAsync(request.Message, conversation.Id);
+                    response = GenerateReservationResponse(reservationSuggestion, entities);
+                    data = reservationSuggestion;
+                    break;
+
+                case "analytics":
+                    if (userId == null)
+                    {
+                        response = "Bạn cần đăng nhập để xem thống kê.";
+                    }
+                    else
+                    {
+                        var analyticsResult = await QueryAnalyticsAsync(request.Message, conversation.Id, userId.Value);
+                        response = analyticsResult.Summary;
+                        data = analyticsResult.Data;
+                    }
+                    break;
+
+                default:
+                    response = "Xin chào! Tôi có thể giúp bạn:\n" +
+                               "- Gợi ý món ăn\n" +
+                               "- Tìm khuyến mãi\n" +
+                               "- Đặt bàn\n" +
+                               "- Xem thống kê (dành cho quản lý)";
+                    break;
+            }
+
+            // Save assistant response
+            await SaveMessageAsync(conversation.Id, "assistant", response, new { intent, entities });
+            await _context.SaveChangesAsync();
+
+            return new SendMessageResponse
+            {
+                SessionId = conversation.SessionId,
+                Response = response,
+                IntentType = intent,
+                Data = data,
+                Timestamp = DateTime.UtcNow
+            };
+        }
+
+        public async Task<List<MenuSuggestionDto>> SuggestMenuItemsAsync(string userMessage, int? userId, int conversationId)
+        {
+            var entities = _intentService.ExtractEntities(userMessage, "menu_suggestion");
+
+            // Base query
+            var query = _context.MenuItems.Where(m => m.IsAvailable);
+
+            // Apply filters from entities
+            // Note: Check if category has vegetarian items (would need a property on Category or MenuItem)
+            if (entities.ContainsKey("dietary") && entities["dietary"].ToString() == "vegetarian")
+            {
+                // Filter by categories known to have vegetarian items or add IsVegetarian property to MenuItem if needed
+                // For now, apply basic filter - you may need to extend this based on your needs
+                query = query.Where(m => m.IsActive && m.IsAvailable);
+            }
+
+            if (entities.ContainsKey("budget"))
+            {
+                var budget = Convert.ToDecimal(entities["budget"]);
+                query = query.Where(m => m.Price <= budget);
+            }
+
+            // Get user preferences from HistoryLog if userId exists
+            if (userId.HasValue)
+            {
+                var userOrderHistory = await _context.HistoryLogs
+                    .Where(h => h.Entity == "OrderItem"
+                             && h.UserId == userId
+                             && h.CreatedAt >= DateTime.UtcNow.AddMonths(-3))
+                    .ToListAsync();
+
+                if (userOrderHistory.Any())
+                {
+                    var preferredCategories = userOrderHistory
+                        .Select(h => JsonSerializer.Deserialize<Dictionary<string, object>>(h.NewData))
+                        .Where(data => data.ContainsKey("CategoryId"))
+                        .GroupBy(data => Convert.ToInt32(data["CategoryId"]))
+                        .OrderByDescending(g => g.Count())
+                        .Take(2)
+                        .Select(g => g.Key)
+                        .ToList();
+
+                    if (preferredCategories.Any())
+                        query = query.Where(m => preferredCategories.Contains(m.CategoryId ?? 0));
+                }
+            }
+
+            var items = await query.Take(5).ToListAsync();
+
+            var suggestions = items.Select(m => new MenuSuggestionDto
+            {
+                MenuItemId = m.Id,
+                Name = m.Name,
+                Description = m.Description,
+                Price = m.Price,
+                ImageUrl = m.ImageUrl,
+                Reason = DetermineReason(m, entities, userId),
+                ConfidenceScore = 0.8
+            }).ToList();
+
+            // Log actions
+            foreach (var suggestion in suggestions)
+            {
+                await _context.AddAsync(new AIChatActionLog
+                {
+                    ConversationId = conversationId,
+                    ActionType = "suggest_item",
+                    EntityType = "MenuItem",
+                    EntityId = suggestion.MenuItemId,
+                    ActionData = JsonSerializer.Serialize(new { reason = suggestion.Reason }),
+                    CreatedAt = DateTime.UtcNow
+                });
+            }
+            await _context.SaveChangesAsync();
+
+            return suggestions;
+        }
+
+        public async Task<List<PromotionSuggestionDto>> SuggestPromotionsAsync(string userMessage, int conversationId)
+        {
+            // Get active promotions
+            var promotions = await _context.Promotions
+                .Where(p => p.Active
+                         && p.StartDate <= DateTime.UtcNow
+                         && p.EndDate >= DateTime.UtcNow)
+                .ToListAsync();
+
+            // Analyze usage from HistoryLog
+            var promotionUsage = await _context.HistoryLogs
+                .Where(h => h.Entity == "Order"
+                         && h.Action == "Create"
+                         && h.CreatedAt >= DateTime.UtcNow.AddMonths(-1))
+                .ToListAsync();
+
+            var usageStats = promotionUsage
+                .Select(h => JsonSerializer.Deserialize<Dictionary<string, object>>(h.NewData))
+                .Where(data => data.ContainsKey("PromotionId") && data["PromotionId"] != null)
+                .GroupBy(data => Convert.ToInt32(data["PromotionId"]))
+                .ToDictionary(g => g.Key, g => g.Count());
+
+            var suggestions = promotions.Select(p => new PromotionSuggestionDto
+            {
+                PromotionId = p.Id,
+                Code = p.Code,
+                Description = p.Description,
+                DiscountValue = p.DiscountAmount,
+                DiscountType = p.DiscountType,
+                Reason = usageStats.ContainsKey(p.Id)
+                    ? $"Được sử dụng {usageStats[p.Id]} lần trong tháng qua"
+                    : "Khuyến mãi mới",
+                UsageCount = usageStats.ContainsKey(p.Id) ? usageStats[p.Id] : 0
+            })
+            .OrderByDescending(p => p.UsageCount)
+            .Take(3)
+            .ToList();
+
+            // Log actions
+            foreach (var suggestion in suggestions)
+            {
+                await _context.AddAsync(new AIChatActionLog
+                {
+                    ConversationId = conversationId,
+                    ActionType = "suggest_promotion",
+                    EntityType = "Promotion",
+                    EntityId = suggestion.PromotionId,
+                    ActionData = JsonSerializer.Serialize(new { usageCount = suggestion.UsageCount }),
+                    CreatedAt = DateTime.UtcNow
+                });
+            }
+            await _context.SaveChangesAsync();
+
+            return suggestions;
+        }
+
+        public async Task<ReservationSuggestionDto> SuggestReservationAsync(string userMessage, int conversationId)
+        {
+            var entities = _intentService.ExtractEntities(userMessage, "reservation");
+
+            var requestedDate = entities.ContainsKey("date")
+                ? Convert.ToDateTime(entities["date"])
+                : DateTime.Today.AddDays(1);
+
+            var requestedTime = entities.ContainsKey("time")
+                ? (TimeSpan)entities["time"]
+                : new TimeSpan(19, 0, 0);
+
+            var partySize = entities.ContainsKey("partySize")
+                ? Convert.ToInt32(entities["partySize"])
+                : 2;
+
+            var requestedDateTime = requestedDate.Add(requestedTime);
+
+            // Find available tables
+            var bookedTableIds = await _context.Reservations
+                .Where(r => r.ReservationTime.Date == requestedDate.Date
+                         && r.Status != "Cancelled")
+                .Select(r => r.TableId)
+                .ToListAsync();
+
+            var availableTables = await _context.Tables
+                .Where(t => t.Capacity >= partySize
+                         && !bookedTableIds.Contains(t.Id))
+                .Select(t => t.Id)
+                .ToListAsync();
+
+            var suggestion = new ReservationSuggestionDto
+            {
+                AvailableTableIds = availableTables,
+                SuggestedTime = requestedDateTime,
+                Reason = availableTables.Any()
+                    ? $"Có {availableTables.Count} bàn trống phù hợp"
+                    : "Không có bàn trống, vui lòng chọn thời gian khác"
+            };
+
+            // Log action
+            await _context.AddAsync(new AIChatActionLog
+            {
+                ConversationId = conversationId,
+                ActionType = "suggest_reservation",
+                EntityType = "Reservation",
+                ActionData = JsonSerializer.Serialize(new
+                {
+                    requestedDate,
+                    requestedTime = requestedTime.ToString(),
+                    partySize,
+                    availableCount = availableTables.Count
+                }),
+                Result = JsonSerializer.Serialize(suggestion),
+                CreatedAt = DateTime.UtcNow
+            });
+            await _context.SaveChangesAsync();
+
+            return suggestion;
+        }
+
+        public async Task<AnalyticsResultDto> QueryAnalyticsAsync(string userMessage, int conversationId, int userId)
+        {
+            // Check if user has permission (admin/manager)
+            var user = await _context.Users.FindAsync(userId);
+            if (user?.Role != "Admin" && user?.Role != "Manager")
+            {
+                throw new UnauthorizedAccessException("Chỉ quản lý mới được xem thống kê");
+            }
+
+            var entities = _intentService.ExtractEntities(userMessage, "analytics");
+            var queryType = entities.ContainsKey("queryType")
+                ? entities["queryType"].ToString()
+                : "revenue";
+
+            AnalyticsResultDto result;
+
+            switch (queryType)
+            {
+                case "revenue":
+                    var period = entities.ContainsKey("period") ? entities["period"].ToString() : "today";
+                    var (startDate, endDate) = GetDateRange(period);
+                    result = await _analyticsService.GetRevenueAnalysisAsync(startDate, endDate);
+                    break;
+
+                case "popular_items":
+                    result = await _analyticsService.GetPopularItemsAsync(10);
+                    break;
+
+                default:
+                    result = await _analyticsService.GetRevenueAnalysisAsync(DateTime.Today, DateTime.Today.AddDays(1));
+                    break;
+            }
+
+            // Log action
+            await _context.AddAsync(new AIChatActionLog
+            {
+                ConversationId = conversationId,
+                ActionType = "query_analytics",
+                ActionData = JsonSerializer.Serialize(entities),
+                Result = JsonSerializer.Serialize(new { queryType, summary = result.Summary }),
+                CreatedAt = DateTime.UtcNow
+            });
+            await _context.SaveChangesAsync();
+
+            return result;
+        }
+
+        public async Task<ConversationDto> GetConversationAsync(string sessionId)
+        {
+            var conversation = await _context.AIChatConversations
+                .Include(c => c.Messages)
+                .FirstOrDefaultAsync(c => c.SessionId == sessionId);
+
+            if (conversation == null)
+                return null;
+
+            return new ConversationDto
+            {
+                Id = conversation.Id,
+                SessionId = conversation.SessionId,
+                Topic = conversation.Topic,
+                IsActive = conversation.IsActive,
+                StartedAt = conversation.StartedAt,
+                LastMessageAt = conversation.LastMessageAt,
+                Messages = conversation.Messages.Select(m => new ChatMessageDto
+                {
+                    Role = m.Role,
+                    Content = m.Content,
+                    CreatedAt = m.CreatedAt,
+                    Metadata = string.IsNullOrEmpty(m.Metadata)
+                        ? null
+                        : JsonSerializer.Deserialize<object>(m.Metadata)
+                }).ToList()
+            };
+        }
+
+        public async Task<ConversationHistoryResponse> GetUserConversationsAsync(int? userId, int page = 1, int pageSize = 10)
+        {
+            var query = _context.AIChatConversations.AsQueryable();
+
+            if (userId.HasValue)
+                query = query.Where(c => c.UserId == userId);
+            else
+                query = query.Where(c => c.UserId == null); // Guest conversations
+
+            var totalCount = await query.CountAsync();
+
+            var conversations = await query
+                .OrderByDescending(c => c.LastMessageAt)
+                .Skip((page - 1) * pageSize)
+                .Take(pageSize)
+                .Include(c => c.Messages)
+                .ToListAsync();
+
+            return new ConversationHistoryResponse
+            {
+                Conversations = conversations.Select(c => new ConversationDto
+                {
+                    Id = c.Id,
+                    SessionId = c.SessionId,
+                    Topic = c.Topic,
+                    IsActive = c.IsActive,
+                    StartedAt = c.StartedAt,
+                    LastMessageAt = c.LastMessageAt,
+                    Messages = c.Messages.Select(m => new ChatMessageDto
+                    {
+                        Role = m.Role,
+                        Content = m.Content,
+                        CreatedAt = m.CreatedAt
+                    }).ToList()
+                }).ToList(),
+                TotalCount = totalCount
+            };
+        }
+
+        public async Task<bool> EndConversationAsync(string sessionId)
+        {
+            var conversation = await _context.AIChatConversations
+                .FirstOrDefaultAsync(c => c.SessionId == sessionId);
+
+            if (conversation == null)
+                return false;
+
+            conversation.IsActive = false;
+            await _context.SaveChangesAsync();
+            return true;
+        }
+
+        // Helper methods
+        private async Task SaveMessageAsync(int conversationId, string role, string content, object metadata = null)
+        {
+            var message = new AIChatMessage
+            {
+                ConversationId = conversationId,
+                Role = role,
+                Content = content,
+                Metadata = metadata != null ? JsonSerializer.Serialize(metadata) : null,
+                CreatedAt = DateTime.UtcNow
+            };
+
+            await _context.AIChatMessages.AddAsync(message);
+        }
+
+        private string DetermineReason(Restaurant_Management.Models.Entities.MenuItem item, Dictionary<string, object> entities, int? userId)
+        {
+            var reasons = new List<string>();
+
+            if (entities.ContainsKey("dietary") && item.IsVegetarian)
+                reasons.Add("Phù hợp khẩu vị chay");
+
+            if (entities.ContainsKey("budget"))
+                reasons.Add("Trong ngân sách");
+
+            if (userId.HasValue)
+                reasons.Add("Dựa trên sở thích của bạn");
+
+            return reasons.Any() ? string.Join(", ", reasons) : "Món phổ biến";
+        }
+
+        private string GenerateMenuResponse(List<MenuSuggestionDto> suggestions)
+        {
+            if (!suggestions.Any())
+                return "Xin lỗi, tôi không tìm thấy món phù hợp. Bạn có thể thử tiêu chí khác không?";
+
+            var response = "Dựa trên yêu cầu của bạn, tôi gợi ý:\n\n";
+            foreach (var item in suggestions)
+            {
+                response += $"🍽️ **{item.Name}** - {item.Price:N0} VNĐ\n";
+                response += $"   {item.Description}\n";
+                response += $"   _{item.Reason}_\n\n";
+            }
+
+            return response;
+        }
+
+        private string GeneratePromotionResponse(List<PromotionSuggestionDto> suggestions)
+        {
+            if (!suggestions.Any())
+                return "Hiện tại không có khuyến mãi phù hợp.";
+
+            var response = "Các khuyến mãi đang áp dụng:\n\n";
+            foreach (var promo in suggestions)
+            {
+                response += $"🎁 **{promo.Code}**\n";
+                response += $"   {promo.Description}\n";
+                response += $"   Giảm: {promo.DiscountValue:N0} {(promo.DiscountType == "Percentage" ? "%" : "VNĐ")}\n";
+                response += $"   _{promo.Reason}_\n\n";
+            }
+
+            return response;
+        }
+
+        private string GenerateReservationResponse(ReservationSuggestionDto suggestion, Dictionary<string, object> entities)
+        {
+            if (!suggestion.AvailableTableIds.Any())
+                return "Rất tiếc, không có bàn trống vào thời gian bạn yêu cầu. Bạn có thể chọn thời gian khác không?";
+
+            var partySize = entities.ContainsKey("partySize") ? entities["partySize"] : 2;
+            return $"Tuyệt vời! Có {suggestion.AvailableTableIds.Count} bàn trống cho {partySize} người vào {suggestion.SuggestedTime:dd/MM/yyyy HH:mm}.\n\n" +
+                   $"Bạn có muốn tôi đặt bàn ngay không?";
+        }
+
+        private (DateTime startDate, DateTime endDate) GetDateRange(string period)
+        {
+            return period switch
+            {
+                "today" => (DateTime.Today, DateTime.Today.AddDays(1)),
+                "week" => (DateTime.Today.AddDays(-7), DateTime.Today.AddDays(1)),
+                "month" => (DateTime.Today.AddMonths(-1), DateTime.Today.AddDays(1)),
+                _ => (DateTime.Today, DateTime.Today.AddDays(1))
+            };
+        }
+    }
+}

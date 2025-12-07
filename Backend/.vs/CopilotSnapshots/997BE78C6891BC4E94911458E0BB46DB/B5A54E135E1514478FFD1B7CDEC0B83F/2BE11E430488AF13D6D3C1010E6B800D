@@ -1,0 +1,8 @@
+﻿namespace Restaurant_Management.Services.AI
+{
+    public interface IAIIntentDetectionService
+    {
+        string DetectIntent(string message);
+        Dictionary<string, object> ExtractEntities(string message, string intent);
+    }
+}

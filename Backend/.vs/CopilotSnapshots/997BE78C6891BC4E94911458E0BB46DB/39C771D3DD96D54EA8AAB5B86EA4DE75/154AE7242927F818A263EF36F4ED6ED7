@@ -1,0 +1,522 @@
+﻿using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using Restaurant_Management.Data;
+using Restaurant_Management.Models.DTO;
+using Restaurant_Management.Models.Entities;
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Security.Claims;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using static Restaurant_Management.Models.Entities.User;
+
+namespace Restaurant_Management.Controllers
+{
+    [Authorize]
+    [Route("api/[controller]")]
+    [ApiController]// Yêu cầu đăng nhập cho tất cả endpoints
+    public class UsersController : ControllerBase
+    {
+        private readonly RestaurantDbContext _context;
+        private const int MAX_LOGIN_ATTEMPTS = 5;
+        private const int LOCK_DURATION_MINUTES = 30;
+
+        public UsersController(RestaurantDbContext context)
+        {
+            _context = context;
+        }
+
+        // GET: api/Users - CHỈ ADMIN/MANAGER
+        [Authorize(Roles = "Admin")]
+        [HttpGet]        
+        public async Task<ActionResult<IEnumerable<UserDTO>>> GetUsers()
+        {
+            var users = await _context.Users
+                .Select(u => new UserDTO
+                {
+                    Id = u.Id,
+                    Username = u.Username,
+                    Email = u.Email,
+                    FullName = u.FullName,
+                    Phone = u.Phone,
+                    Role = u.Role,
+                    IsActive = u.IsActive,
+                    IsLocked = u.IsLocked,
+                    LastLoginAt = u.LastLoginAt,
+                    CreatedAt = u.CreatedAt
+                })
+                .ToListAsync();
+
+            return Ok(users);
+        }
+
+        // GET: api/Users/5 - Admin/Manager hoặc chính user đó       
+        [HttpGet("{id}")]
+        public async Task<ActionResult<UserDTO>> GetUser(int id)
+        {
+            var currentUserId = GetCurrentUserId();
+            var currentUserRole = GetCurrentUserRole();
+           
+            if (currentUserId != id && currentUserRole != UserRole.Admin && currentUserRole != UserRole.Manager)
+            {
+                return Forbid();
+            }
+
+            var user = await _context.Users.FindAsync(id);
+            if (user == null) return NotFound();
+
+            return Ok(new UserDTO
+            {
+                Id = user.Id,
+                Username = user.Username,
+                Email = user.Email,
+                FullName = user.FullName,
+                Phone = user.Phone,
+                Role = user.Role,
+                IsActive = user.IsActive,
+                IsLocked = user.IsLocked,
+                LastLoginAt = user.LastLoginAt,
+                CreatedAt = user.CreatedAt
+            });
+        }
+
+        // POST: api/Users - CHỈ ADMIN
+        [HttpPost]
+        [Authorize(Roles = "Admin")]
+        public async Task<ActionResult<UserDTO>> PostUser(CreateUserDTO dto)
+        {
+            // Validate username + password
+            if (string.IsNullOrWhiteSpace(dto.FullName) || string.IsNullOrWhiteSpace(dto.Password))
+                return BadRequest(new { message = "Fullname và Password là bắt buộc" });
+
+            if (dto.Password.Length < 6)
+                return BadRequest(new { message = "Password phải có ít nhất 6 ký tự" });
+
+            // Validate email format
+            if (!string.IsNullOrEmpty(dto.Email) && !IsValidEmail(dto.Email))
+                return BadRequest(new { message = "Email không hợp lệ" });
+
+            // Validate phone format (VN)
+            if (!string.IsNullOrEmpty(dto.Phone) && !IsValidVietnamPhone(dto.Phone))
+                return BadRequest(new { message = "Số điện thoại không hợp lệ" });
+
+            // Check trùng username
+            if (await _context.Users.AnyAsync(u => u.Username == dto.Username))
+                return Conflict(new { message = $"Username '{dto.Username}' đã tồn tại" });
+
+            // Check trùng email
+            if (!string.IsNullOrEmpty(dto.Email) &&
+                await _context.Users.AnyAsync(u => u.Email == dto.Email))
+                return Conflict(new { message = $"Email '{dto.Email}' đã tồn tại" });
+
+            // Check trùng phone
+            if (!string.IsNullOrEmpty(dto.Phone) &&
+                await _context.Users.AnyAsync(u => u.Phone == dto.Phone))
+                return Conflict(new { message = $"Số điện thoại '{dto.Phone}' đã tồn tại" });
+
+            var defaultPassword = GenerateDefaultPassword(dto.FullName);
+            var defautUsername = SlugifyName(dto.FullName);
+
+            var user = new User
+            {
+                Username = dto.Username ?? defautUsername,
+                PasswordHash = BCrypt.Net.BCrypt.HashPassword(defaultPassword),
+                Email = dto.Email,
+                FullName = dto.FullName,
+                Phone = dto.Phone,
+                Role = dto.Role,
+                IsActive = true,
+                CreatedAt = DateTime.UtcNow,
+                UpdatedAt = DateTime.UtcNow,
+                CreatedBy = GetCurrentUserId()
+            };
+
+            _context.Users.Add(user);
+            await _context.SaveChangesAsync();
+
+            await LogAudit($"Tạo user mới: {user.Username}, Role: {user.Role}");
+
+            return CreatedAtAction("GetUser", new { id = user.Id }, new UserDTO
+            {
+                Id = user.Id,
+                Username = user.Username,
+                Email = user.Email,
+                FullName = user.FullName,
+                Role = user.Role
+            });
+        }
+        // PUT: api/Users/5 - Admin hoặc chính user đó (nhưng không đổi role)
+        [HttpPut("{id}")]
+        public async Task<IActionResult> PutUser(int id, UpdateUserDTO dto)
+        {
+            var currentUserId = GetCurrentUserId();
+            var currentUserRole = GetCurrentUserRole();
+
+            var user = await _context.Users.FindAsync(id);
+            if (user == null) return NotFound();
+
+         
+            if (currentUserId != id && currentUserRole != UserRole.Admin && currentUserRole != UserRole.Manager)
+            {
+                return Forbid();
+            }
+
+         
+            if (dto.Role.HasValue && dto.Role != user.Role)
+            {
+                if (currentUserRole != UserRole.Admin)
+                {
+                    return Forbid();
+                }
+                user.Role = dto.Role.Value;
+                await LogAudit($"Đổi role user {user.Username} thành {user.Role}");
+            }
+
+          
+            if (!string.IsNullOrEmpty(dto.Email) && dto.Email != user.Email)
+            {
+                if (await _context.Users.AnyAsync(u => u.Email == dto.Email && u.Id != id))
+                {
+                    return Conflict(new { message = "Email đã tồn tại" });
+                }
+                user.Email = dto.Email;
+            }
+
+            if (!string.IsNullOrEmpty(dto.FullName)) user.FullName = dto.FullName;
+            if (!string.IsNullOrEmpty(dto.Phone)) user.Phone = dto.Phone;
+
+            user.UpdatedAt = DateTime.UtcNow;
+            user.UpdatedBy = currentUserId;
+
+            await _context.SaveChangesAsync();
+
+            return NoContent();
+        }
+
+        // DELETE: api/Users/5 - CHỈ ADMIN
+        [HttpDelete("{id}")]
+        [Authorize(Roles = "Admin")]
+        public async Task<IActionResult> DeleteUser(int id)
+        {
+            var currentUserId = GetCurrentUserId();
+
+           
+            if (currentUserId == id)
+            {
+                return BadRequest(new { message = "Không thể xóa chính mình" });
+            }
+
+            var user = await _context.Users.FindAsync(id);
+            if (user == null) return NotFound();
+
+            _context.Users.Remove(user);
+            await _context.SaveChangesAsync();
+
+            await LogAudit($"Xóa user: {user.Username}");
+
+            return NoContent();
+        }
+
+        // POST: api/Users/5/reset-password - CHỈ ADMIN
+        [HttpPost("{id}/reset-password")]
+        [Authorize(Roles = "Admin")]
+        public async Task<IActionResult> ResetPassword(int id)
+        {
+            var user = await _context.Users.FindAsync(id);
+            if (user == null) return NotFound();
+
+            user.PasswordHash = BCrypt.Net.BCrypt.HashPassword("123456");
+            user.UpdatedAt = DateTime.UtcNow;
+            user.FailedLoginAttempts = 0;
+            user.IsLocked = false;
+            user.LockedUntil = null;
+
+            await _context.SaveChangesAsync();
+            await LogAudit($"Reset password cho user: {user.Username}");
+
+            return Ok(new { message = "Mật khẩu đã được reset về '123456'" });
+        }
+
+        // POST: api/Users/5/change-password - User tự đổi mật khẩu của mình
+        [HttpPost("{id}/change-password")]
+        public async Task<IActionResult> ChangePassword(int id, [FromBody] ChangePasswordDTO dto)
+        {
+            var currentUserId = GetCurrentUserId();
+
+            // Chỉ được đổi mật khẩu của chính mình
+            if (currentUserId != id)
+            {
+                return Forbid();
+            }
+
+            var user = await _context.Users.FindAsync(id);
+            if (user == null) return NotFound();
+
+            // Verify mật khẩu cũ
+            if (!BCrypt.Net.BCrypt.Verify(dto.OldPassword, user.PasswordHash))
+            {
+                return BadRequest(new { message = "Mật khẩu cũ không đúng" });
+            }
+
+            // Validate mật khẩu mới
+            if (dto.NewPassword.Length < 6)
+            {
+                return BadRequest(new { message = "Mật khẩu mới phải có ít nhất 6 ký tự" });
+            }
+
+            user.PasswordHash = BCrypt.Net.BCrypt.HashPassword(dto.NewPassword);
+            user.UpdatedAt = DateTime.UtcNow;
+
+            await _context.SaveChangesAsync();
+            await LogAudit($"User {user.Username} đã đổi mật khẩu");
+
+            return Ok(new { message = "Đổi mật khẩu thành công" });
+        }
+
+        // POST: api/Users/5/lock - Khóa tài khoản (ADMIN)
+        [HttpPost("{id}/lock")]
+        [Authorize(Roles = "Admin")]
+        public async Task<IActionResult> LockUser(int id, [FromBody] LockUserDTO dto)
+        {
+            var currentUserId = GetCurrentUserId();
+
+            if (currentUserId == id)
+            {
+                return BadRequest(new { message = "Không thể khóa chính mình" });
+            }
+
+            var user = await _context.Users.FindAsync(id);
+            if (user == null) return NotFound();
+
+            user.IsLocked = true;
+            user.LockedUntil = dto.LockedUntil;
+            user.UpdatedAt = DateTime.UtcNow;
+
+            await _context.SaveChangesAsync();
+            await LogAudit($"Khóa user: {user.Username} đến {dto.LockedUntil?.ToString() ?? "vô thời hạn"}");
+
+            return Ok(new { message = "Đã khóa tài khoản" });
+        }
+
+        // POST: api/Users/5/unlock - Mở khóa tài khoản (ADMIN)
+        [HttpPost("{id}/unlock")]
+        [Authorize(Roles = "Admin")]
+        public async Task<IActionResult> UnlockUser(int id)
+        {
+            var user = await _context.Users.FindAsync(id);
+            if (user == null) return NotFound();
+
+            user.IsLocked = false;
+            user.LockedUntil = null;
+            user.FailedLoginAttempts = 0;
+            user.UpdatedAt = DateTime.UtcNow;
+
+            await _context.SaveChangesAsync();
+            await LogAudit($"Mở khóa user: {user.Username}");
+
+            return Ok(new { message = "Đã mở khóa tài khoản" });
+        }
+
+        // POST: api/Users/5/activate - Kích hoạt/Vô hiệu hóa (ADMIN)
+        [HttpPost("{id}/toggle-active")]
+        [Authorize(Roles = "Admin")]
+        public async Task<IActionResult> ToggleActive(int id)
+        {
+            var currentUserId = GetCurrentUserId();
+
+            if (currentUserId == id)
+            {
+                return BadRequest(new { message = "Không thể vô hiệu hóa chính mình" });
+            }
+
+            var user = await _context.Users.FindAsync(id);
+            if (user == null) return NotFound();
+
+            user.IsActive = !user.IsActive;
+            user.UpdatedAt = DateTime.UtcNow;
+
+            await _context.SaveChangesAsync();
+            await LogAudit($"{(user.IsActive ? "Kích hoạt" : "Vô hiệu hóa")} user: {user.Username}");
+
+            return Ok(new
+            {
+                message = user.IsActive ? "Đã kích hoạt tài khoản" : "Đã vô hiệu hóa tài khoản",
+                isActive = user.IsActive
+            });
+        }
+
+        /// <summary>
+        /// GET: api/users/profile - Lấy thông tin profile của user hiện tại
+        /// </summary>
+        [HttpGet("profile")]
+        [Authorize]
+        public async Task<IActionResult> GetProfile()
+        {
+            var currentUserId = GetCurrentUserId();
+            var user = await _context.Users.FindAsync(currentUserId);
+
+            if (user == null)
+                return NotFound(new { message = "Không tìm thấy thông tin user" });
+
+            return Ok(new
+            {
+                id = user.Id,
+                username = user.Username,
+                email = user.Email,
+                fullName = user.FullName,
+                phone = user.Phone,
+                role = user.Role.ToString(),
+                isActive = user.IsActive,
+                createdAt = user.CreatedAt,
+                lastLoginAt = user.LastLoginAt
+            });
+        }
+
+        /// <summary>
+        /// PUT: api/users/profile - Cập nhật thông tin profile (FullName, Email, Phone)
+        /// User không thể sửa: Username, Role, Password (dùng endpoint riêng)
+        /// </summary>
+        [HttpPut("profile")]
+        [Authorize]
+        public async Task<IActionResult> UpdateProfile([FromBody] UpdateProfileDTO dto)
+        {
+            if (!ModelState.IsValid)
+                return BadRequest(ModelState);
+
+            var currentUserId = GetCurrentUserId();
+            var user = await _context.Users.FindAsync(currentUserId);
+
+            if (user == null)
+                return NotFound(new { message = "Không tìm thấy user" });
+
+            // Validate email format
+            if (!string.IsNullOrEmpty(dto.Email) && !IsValidEmail(dto.Email))
+                return BadRequest(new { message = "Email không hợp lệ" });
+
+            // Validate phone format (VN)
+            if (!string.IsNullOrEmpty(dto.Phone) && !IsValidVietnamPhone(dto.Phone))
+                return BadRequest(new { message = "Số điện thoại không hợp lệ (VD: 0912345678)" });
+
+            // Check trùng email (trừ user hiện tại)
+            if (!string.IsNullOrEmpty(dto.Email) && dto.Email != user.Email)
+            {
+                if (await _context.Users.AnyAsync(u => u.Email == dto.Email && u.Id != currentUserId))
+                    return Conflict(new { message = "Email này đã được sử dụng bởi tài khoản khác" });
+
+                user.Email = dto.Email;
+            }
+
+            // Check trùng phone (trừ user hiện tại)
+            if (!string.IsNullOrEmpty(dto.Phone) && dto.Phone != user.Phone)
+            {
+                if (await _context.Users.AnyAsync(u => u.Phone == dto.Phone && u.Id != currentUserId))
+                    return Conflict(new { message = "Số điện thoại này đã được sử dụng bởi tài khoản khác" });
+
+                user.Phone = dto.Phone;
+            }
+
+            // Cập nhật FullName
+            if (!string.IsNullOrEmpty(dto.FullName) && dto.FullName != user.FullName)
+            {
+                user.FullName = dto.FullName.Trim();
+            }
+
+            user.UpdatedAt = DateTime.UtcNow;
+            user.UpdatedBy = currentUserId;
+
+            await _context.SaveChangesAsync();
+
+            await LogAudit($"Cập nhật profile: Email={user.Email}, Phone={user.Phone}, FullName={user.FullName}");
+
+            return Ok(new
+            {
+                message = "Cập nhật thông tin thành công",
+                user = new
+                {
+                    id = user.Id,
+                    username = user.Username,
+                    email = user.Email,
+                    fullName = user.FullName,
+                    phone = user.Phone,
+                    role = user.Role.ToString(),
+                    updatedAt = user.UpdatedAt
+                }
+            });
+        }
+
+#endregion
+#region // HELPER METHODS
+        {
+            var userIdClaim = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+            return int.TryParse(userIdClaim, out var userId) ? userId : 0;
+        }
+
+        private UserRole GetCurrentUserRole()
+        {
+            var roleClaim = User.FindFirst(ClaimTypes.Role)?.Value;
+            return Enum.TryParse<UserRole>(roleClaim, out var role) ? role : UserRole.Staff;
+        }
+
+        private async Task LogAudit(string action)
+        {
+            var log = new HistoryLog
+            {
+                Entity = "User",
+                Action = action,
+                UserId = GetCurrentUserId(),
+                CreatedAt = DateTime.UtcNow,
+                NewData = $"{{\"action\": \"{action}\", \"timestamp\": \"{DateTime.UtcNow:O}\", \"ipAddress\": \"{HttpContext.Connection.RemoteIpAddress?.ToString()}\"}}"
+            };
+
+            _context.HistoryLogs.Add(log);
+            await _context.SaveChangesAsync();
+        }
+        private bool IsValidEmail(string email)
+        {
+            return Regex.IsMatch(email,
+                @"^[^@\s]+@[^@\s]+\.[^@\s]+$",
+                RegexOptions.IgnoreCase);
+        }
+
+        private bool IsValidVietnamPhone(string phone)
+        {
+            return Regex.IsMatch(phone,
+                @"^(03|05|07|08|09)\d{8}$");
+        }
+
+        private string SlugifyName(string fullName)
+        {
+            string normalized = fullName.Normalize(NormalizationForm.FormD);
+            var sb = new StringBuilder();
+
+            foreach (char c in normalized)
+            {
+                if (CharUnicodeInfo.GetUnicodeCategory(c) != UnicodeCategory.NonSpacingMark)
+                    sb.Append(c);
+            }
+
+            string noAccent = sb.ToString().Normalize(NormalizationForm.FormC);
+           
+            noAccent = Regex.Replace(noAccent.ToLower(), @"[^a-z0-9]+", "");
+
+            return noAccent;
+        }
+
+        private string GenerateDefaultPassword(string fullName)
+        {
+            var slug = SlugifyName(fullName);
+            var year = DateTime.UtcNow.Year;
+            return $"{slug}!{year}";
+        }
+
+        #endregion
+    }
+
+
+
+}

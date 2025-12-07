@@ -1,0 +1,670 @@
+﻿using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.Tokens;
+using QRCoder;
+using Restaurant_Management.Data;
+using Restaurant_Management.Models.DTO;
+using Restaurant_Management.Models.Entities;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using System.Text;
+
+namespace Restaurant_Management.Controllers
+{
+    [Authorize]
+    [Route("api/[controller]")]
+    [ApiController]
+    public class TablesController : ControllerBase
+    {
+        private readonly RestaurantDbContext _context;
+        private readonly IConfiguration _configuration;
+        private readonly string _jwtkey;
+
+        public TablesController(RestaurantDbContext context, IConfiguration configuration)
+        {
+            _context = context;
+            _configuration = configuration;
+            _jwtkey = Environment.GetEnvironmentVariable("JWT_KEY") ?? _configuration["Jwt:Key"] ?? "";
+        }
+
+        // ============================================
+        // 🔹 BASIC CRUD
+        // ============================================
+
+        [AllowAnonymous]
+        [HttpGet]
+        public async Task<ActionResult<IEnumerable<TableDTO>>> GetTables()
+        {
+            var tables = await _context.Tables.ToListAsync();
+            return tables.Select(MapToDto).ToList();
+        }
+
+        [AllowAnonymous]
+        [HttpGet("{id}")]
+        public async Task<ActionResult<TableDTO>> GetTable(int id)
+        {
+            var table = await _context.Tables.FindAsync(id);
+            if (table == null)
+                return NotFound(new { message = $"Không tìm thấy Table {id}" });
+
+            return MapToDto(table);
+        }
+
+        [Authorize(Roles = "Admin")]
+        [HttpPost]
+        public async Task<ActionResult<TableDTO>> PostTable([FromBody] TableUpdateDto dto)
+        {
+            if (await _context.Tables.AnyAsync(t => t.TableNumber == dto.TableNumber))
+                return Conflict(new { message = $"Bàn số {dto.TableNumber} đã tồn tại." });
+
+            var frontendUrl = _configuration["FrontendUrl"] ?? "http://localhost:5173";
+            var table = new Table
+            {
+                TableNumber = dto.TableNumber,
+                TableName = dto.TableName,
+                Capacity = dto.Capacity,
+                Location = dto.Location,
+                Status = dto.Status ?? "Available",
+                IsActive = dto.IsActive,
+                CreatedAt = DateTime.UtcNow,
+                QrCodeUrl = $"{frontendUrl}/order?table={dto.TableNumber}"
+            };
+
+            _context.Tables.Add(table);
+            await _context.SaveChangesAsync();
+
+            return CreatedAtAction(nameof(GetTable), new { id = table.Id }, MapToDto(table));
+        }
+
+        [Authorize(Roles = "Admin")]
+        [HttpPut("{id}")]
+        public async Task<IActionResult> PutTable(int id, [FromBody] TableUpdateDto dto)
+        {
+            var table = await _context.Tables.FindAsync(id);
+            if (table == null)
+                return NotFound(new { message = $"Table {id} không tồn tại." });
+
+            if (await _context.Tables.AnyAsync(t => t.TableNumber == dto.TableNumber && t.Id != id))
+                return Conflict(new { message = $"TableNumber {dto.TableNumber} đã tồn tại." });
+
+            var frontendUrl = _configuration["FrontendUrl"] ?? "http://localhost:5173";
+            table.TableNumber = dto.TableNumber;
+            table.TableName = dto.TableName;
+            table.Capacity = dto.Capacity;
+            table.Location = dto.Location;
+            table.Status = dto.Status;
+            table.IsActive = dto.IsActive;
+            table.QrCodeUrl = $"{frontendUrl}/order?table={dto.TableNumber}";
+
+            await _context.SaveChangesAsync();
+            return Ok(new { message = "Cập nhật Table thành công." });
+        }
+
+        [Authorize(Roles = "Admin")]
+        [HttpDelete("{id}")]
+        public async Task<IActionResult> DeleteTable(int id)
+        {
+            var table = await _context.Tables.FindAsync(id);
+            if (table == null)
+                return NotFound(new { message = $"Table {id} không tồn tại." });
+
+            _context.Tables.Remove(table);
+            await _context.SaveChangesAsync();
+
+            return Ok(new { message = $"Xóa Table {id} thành công." });
+        }
+
+        // ============================================
+        // 🔹 CHUYỂN BÀN (Move Table)
+        // ============================================
+
+        /// <summary>
+        /// POST: Chuyển order từ bàn A sang bàn B
+        /// </summary>
+        [Authorize(Roles = "Admin,Staff")]
+        [HttpPost("{fromTableId}/move-to/{toTableId}")]
+        public async Task<IActionResult> MoveTable(int fromTableId, int toTableId)
+        {
+            using var transaction = await _context.Database.BeginTransactionAsync();
+            try
+            {
+                // 1️ Validate bàn nguồn
+                var fromTable = await _context.Tables.FindAsync(fromTableId);
+                if (fromTable == null)
+                    return NotFound(new { message = $"Bàn nguồn {fromTableId} không tồn tại." });
+
+                if (fromTable.Status != "Occupied")
+                    return BadRequest(new { message = $"Bàn {fromTable.TableNumber} chưa có khách." });
+
+                // 2️ Validate bàn đích
+                var toTable = await _context.Tables.FindAsync(toTableId);
+                if (toTable == null)
+                    return NotFound(new { message = $"Bàn đích {toTableId} không tồn tại." });
+
+                if (toTable.Status == "Occupied")
+                    return BadRequest(new { message = $"Bàn {toTable.TableNumber} đã có khách." });
+
+                // 3️ Tìm order đang active ở bàn nguồn
+                var orderTable = await _context.OrderTables
+                    .Include(ot => ot.Order)
+                    .Where(ot => ot.TableId == fromTableId
+                        && ot.Order.Status != "Completed"
+                        && ot.Order.Status != "Cancelled")
+                    .FirstOrDefaultAsync();
+
+                if (orderTable == null)
+                    return NotFound(new { message = $"Không tìm thấy order đang hoạt động ở bàn {fromTable.TableNumber}." });
+
+                // 4️ Chuyển bàn
+                orderTable.TableId = toTableId;
+
+              
+                var frontendUrl = _configuration["FrontendUrl"] ?? "https://localhost:5173";
+                var newQrUrl = $"{frontendUrl}/order?tableId={toTableId}";
+                var newToken = GenerateTableToken(toTableId, orderTable.OrderId);
+
+              
+                fromTable.Status = "Available";
+                fromTable.QrCodeUrl = null; 
+
+                toTable.Status = "Occupied";
+                toTable.QrCodeUrl = newQrUrl;
+
+                await _context.SaveChangesAsync();
+                await transaction.CommitAsync();
+
+               
+
+                return Ok(new
+                {
+                    message = $"Đã chuyển Order #{orderTable.Order.OrderNumber} từ bàn {fromTable.TableNumber} sang bàn {toTable.TableNumber}",
+                    orderId = orderTable.OrderId,
+                    orderNumber = orderTable.Order.OrderNumber,
+                    fromTable = new { id = fromTable.Id, number = fromTable.TableNumber },
+                    toTable = new { id = toTable.Id, number = toTable.TableNumber },
+                    token = newToken, 
+                });
+            }
+            catch (Exception ex)
+            {
+                await transaction.RollbackAsync();
+                return StatusCode(500, new { message = "Lỗi chuyển bàn.", error = ex.Message });
+            }
+        }
+
+        // ============================================
+        // 🔹 GHÉP BÀN (Merge Tables)
+        // ============================================
+
+        /// <summary>
+        /// POST: Ghép nhiều bàn vào 1 order
+        /// </summary>
+        [Authorize(Roles = "Admin,Staff")]
+        [HttpPost("merge")]
+        public async Task<IActionResult> MergeTables([FromBody] MergeTablesDto dto)
+        {
+            using var transaction = await _context.Database.BeginTransactionAsync();
+            try
+            {
+                if (dto.TableIds.Count < 2)
+                    return BadRequest(new { message = "Cần ít nhất 2 bàn để ghép." });
+
+                // 1️ Validate các bàn
+                var tables = await _context.Tables
+                    .Where(t => dto.TableIds.Contains(t.Id))
+                    .ToListAsync();
+
+                if (tables.Count != dto.TableIds.Count)
+                    return BadRequest(new { message = "Một hoặc nhiều bàn không tồn tại." });
+
+                // 2️ Tìm các order đang active ở các bàn
+                var activeOrders = await _context.OrderTables
+                    .Include(ot => ot.Order).ThenInclude(o => o.OrderDetails).ThenInclude(od => od.MenuItem)
+                    .Where(ot => dto.TableIds.Contains(ot.TableId)
+                        && ot.Order.Status != "Completed"
+                        && ot.Order.Status != "Cancelled")
+                    .Select(ot => ot.Order)
+                    .Distinct()
+                    .ToListAsync();
+
+                // 3️ Case 1: Chưa có order nào → Tạo order mới
+                if (!activeOrders.Any())
+                {
+                    return await CreateOrderForMergedTables(dto.TableIds, tables, transaction);
+                }
+
+                // 4️ Case 2: Có 1 order → Link thêm các bàn còn lại
+                if (activeOrders.Count == 1)
+                {
+                    return await AddTablesToExistingOrder(activeOrders.First(), dto.TableIds, tables, transaction);
+                }
+
+                // 5️ Case 3: Có nhiều order → Merge vào Order #3 mới, cancel 2 order cũ
+                return await MergeMultipleOrdersToNew(activeOrders, dto.TableIds, tables, transaction);
+            }
+            catch (Exception ex)
+            {
+                await transaction.RollbackAsync();
+                return StatusCode(500, new { message = "Lỗi ghép bàn.", error = ex.Message });
+            }
+        }
+
+        // ============================================
+        // 🔹 IN QR CODE
+        // ============================================
+
+        /// <summary>
+        /// GET: In QR code cho bàn (trả về file PNG)
+        /// Mỗi lần in sẽ xóa file cũ và tạo file mới
+        /// </summary>
+        [Authorize(Roles = "Admin,Staff")]
+        [HttpGet("{id}/print-qr")]
+        public async Task<IActionResult> PrintQrCode(int id)
+        {
+            var table = await _context.Tables.FindAsync(id);
+            if (table == null)
+                return NotFound(new { message = $"Bàn {id} không tồn tại." });
+
+            try
+            {
+                // 1️⃣ Xóa file QR cũ (nếu có)
+                string qrFolder = Path.Combine("wwwroot", "qr");
+                Directory.CreateDirectory(qrFolder);
+
+                var oldFiles = Directory.GetFiles(qrFolder, $"table_{table.TableNumber}_*.png");
+                foreach (var oldFile in oldFiles)
+                {
+                    System.IO.File.Delete(oldFile);
+                }
+
+                // 2️⃣ Tạo URL QR
+                string qrData = $"https://localhost:5173/order?table={table.TableNumber}";
+
+                // 3️⃣ Generate QR code
+                var qrGenerator = new QRCodeGenerator();
+                var qrCodeData = qrGenerator.CreateQrCode(qrData, QRCodeGenerator.ECCLevel.Q);
+                var qrCode = new PngByteQRCode(qrCodeData);
+                byte[] qrBytes = qrCode.GetGraphic(20);
+
+                // 4️⃣ Lưu file mới với timestamp
+                string timestamp = DateTime.Now.ToString("yyyyMMddHHmmss");
+                string fileName = $"table_{table.TableNumber}_{timestamp}.png";
+                string filePath = Path.Combine(qrFolder, fileName);
+                await System.IO.File.WriteAllBytesAsync(filePath, qrBytes);
+
+                // 5️⃣ Update QR URL trong database
+                string qrUrl = $"{Request.Scheme}://{Request.Host}/qr/{fileName}";
+                table.QrCodeUrl = qrUrl;
+                await _context.SaveChangesAsync();
+
+                // 6️⃣ Trả về file để in
+                return File(qrBytes, "image/png", fileName);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { message = "Lỗi tạo QR code.", error = ex.Message });
+            }
+        }
+
+        /// <summary>
+        /// GET: Xem QR code (không tạo file mới, chỉ generate on-the-fly)
+        /// </summary>
+        [AllowAnonymous]
+        [HttpGet("{id}/qr-preview")]
+        public async Task<IActionResult> PreviewQrCode(int id)
+        {
+            var table = await _context.Tables.FindAsync(id);
+            if (table == null)
+                return NotFound(new { message = $"Bàn {id} không tồn tại." });
+
+            string qrData = $"https://localhost:5173/order?table={table.TableNumber}";
+
+            var qrGenerator = new QRCodeGenerator();
+            var qrCodeData = qrGenerator.CreateQrCode(qrData, QRCodeGenerator.ECCLevel.Q);
+            var qrCode = new PngByteQRCode(qrCodeData);
+            byte[] qrBytes = qrCode.GetGraphic(20);
+
+            return File(qrBytes, "image/png");
+        }
+
+        /// <summary>
+        /// POST: Tạo lại QR code mới (regenerate)utr
+        /// </summary>
+        [Authorize(Roles = "Admin,Staff")]
+        [HttpPut("{id}/regenerate-qr")]
+        public async Task<IActionResult> RegenerateQr(int id)
+        {
+            var table = await _context.Tables.FindAsync(id);
+            if (table == null)
+                return NotFound(new { message = $"Không tìm thấy Table {id}" });
+
+            // Xóa file cũ
+            string qrFolder = Path.Combine("wwwroot", "qr");
+            Directory.CreateDirectory(qrFolder);
+
+            var oldFiles = Directory.GetFiles(qrFolder, $"table_{table.TableNumber}_*.png");
+            foreach (var oldFile in oldFiles)
+            {
+                System.IO.File.Delete(oldFile);
+            }
+
+            // Tạo file mới
+            string qrData = $"https://localhost:5173/order?table={table.TableNumber}";
+            var qrGenerator = new QRCodeGenerator();
+            var qrCodeData = qrGenerator.CreateQrCode(qrData, QRCodeGenerator.ECCLevel.Q);
+            var qrCode = new PngByteQRCode(qrCodeData);
+            byte[] qrBytes = qrCode.GetGraphic(20);
+
+            string timestamp = DateTime.Now.ToString("yyyyMMddHHmmss");
+            string fileName = $"table_{table.TableNumber}_{timestamp}.png";
+            string filePath = Path.Combine(qrFolder, fileName);
+            await System.IO.File.WriteAllBytesAsync(filePath, qrBytes);
+
+            string qrUrl = $"{Request.Scheme}://{Request.Host}/qr/{fileName}";
+            table.QrCodeUrl = qrUrl;
+            await _context.SaveChangesAsync();
+
+            return Ok(new
+            {
+                message = "Đã tạo lại QR code mới.",
+                qrCodeUrl = qrUrl,
+                downloadUrl = $"{Request.Scheme}://{Request.Host}/api/tables/{id}/print-qr"
+            });
+        }
+
+        // ============================================
+        // 🔹 HELPER METHODS
+        // ============================================
+
+        /// <summary>
+        /// Case 1: Tạo order mới cho các bàn ghép (chưa có order)
+        /// </summary>
+        private async Task<IActionResult> CreateOrderForMergedTables(
+            List<int> tableIds,
+            List<Table> tables,
+            Microsoft.EntityFrameworkCore.Storage.IDbContextTransaction transaction)
+        {
+            // Lấy staff từ token
+            var staffIdClaim = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+            var staff = await _context.Users.FirstOrDefaultAsync(s => s.Username == staffIdClaim);
+
+            if (staff == null)
+                return Unauthorized(new { message = "Không tìm thấy nhân viên." });
+
+            // Tạo order mới
+            var order = new Order
+            {
+                OrderNumber = $"ORD-{DateTime.Now:yyyyMMddHHmmss}",
+                StaffId = staff.Id,
+                CustomerName = "Khách ghép bàn",
+                CustomerPhone = "0399563215",
+                NumberOfGuests = tables.Sum(t => t.Capacity),
+                OrderType = "DineIn",
+                OrderTime = DateTime.UtcNow,
+                CreatedAt = DateTime.UtcNow,
+                UpdatedAt = DateTime.UtcNow,
+                Status = "Ordered"
+            };
+
+            _context.Orders.Add(order);
+            await _context.SaveChangesAsync();
+
+            // Link các bàn vào order
+            foreach (var tableId in tableIds)
+            {
+                _context.OrderTables.Add(new OrderTable
+                {
+                    OrderId = order.Id,
+                    TableId = tableId
+                });
+
+                var table = tables.First(t => t.Id == tableId);
+                table.Status = "Occupied";
+            }
+
+            await _context.SaveChangesAsync();
+            await transaction.CommitAsync();
+
+            return Ok(new
+            {
+                message = $"Đã tạo order mới và ghép {tables.Count} bàn.",
+                orderId = order.Id,
+                orderNumber = order.OrderNumber,
+                tables = tables.Select(t => new { id = t.Id, number = t.TableNumber })
+            });
+        }
+
+        /// <summary>
+        /// Case 2: Thêm bàn vào order đang có sẵn
+        /// </summary>      
+        private async Task<IActionResult> AddTablesToExistingOrder(
+            Order existingOrder,
+            List<int> tableIds,
+            List<Table> tables,
+            Microsoft.EntityFrameworkCore.Storage.IDbContextTransaction transaction)
+        {
+            var existingTableIds = await _context.OrderTables
+                .Where(ot => ot.OrderId == existingOrder.Id)
+                .Select(ot => ot.TableId)
+                .ToListAsync();
+
+            var newTableIds = tableIds.Except(existingTableIds).ToList();
+
+            if (!newTableIds.Any())
+            {
+                await transaction.CommitAsync();
+                return Ok(new
+                {
+                    message = "Các bàn đã được ghép vào order này rồi.",
+                    orderId = existingOrder.Id,
+                    orderNumber = existingOrder.OrderNumber
+                });
+            }
+            
+            var frontendUrl = _configuration["FrontendUrl"] ?? "https://localhost:5173";
+
+            foreach (var tableId in newTableIds)
+            {
+                _context.OrderTables.Add(new OrderTable
+                {
+                    OrderId = existingOrder.Id,
+                    TableId = tableId
+                });
+
+                var table = tables.First(t => t.Id == tableId);
+                table.Status = "Occupied";
+
+              
+                var newQrUrl = $"{frontendUrl}/order?tableId={tableId}";
+                table.QrCodeUrl = newQrUrl;
+            }
+
+            await _context.SaveChangesAsync();
+            await transaction.CommitAsync();
+
+            var addedTables = tables.Where(t => newTableIds.Contains(t.Id)).ToList();
+
+            return Ok(new
+            {
+                message = $"Đã ghép {addedTables.Count} bàn vào Order #{existingOrder.OrderNumber}",
+                orderId = existingOrder.Id,
+                orderNumber = existingOrder.OrderNumber,
+                addedTables = addedTables.Select(t => new {
+                    id = t.Id,
+                    number = t.TableNumber,
+                    qrUrl = t.QrCodeUrl 
+                })
+            });
+        }
+
+        /// <summary>
+        /// Case 3: Merge nhiều order → Tạo Order #3 mới, cancel các order cũ
+        /// </summary>
+        private async Task<IActionResult> MergeMultipleOrdersToNew(
+            List<Order> oldOrders,
+            List<int> tableIds,
+            List<Table> tables,
+            Microsoft.EntityFrameworkCore.Storage.IDbContextTransaction transaction)
+        {
+            // Lấy staff từ token
+            var staffIdClaim = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+            var staff = await _context.Users.FirstOrDefaultAsync(s => s.Username == staffIdClaim);
+
+            if (staff == null)
+                return Unauthorized(new { message = "Không tìm thấy nhân viên." });
+
+            // 1️⃣ Tạo Order #3 mới
+            var newOrder = new Order
+            {
+                OrderNumber = $"ORD-{DateTime.Now:yyyyMMddHHmmss}",
+                StaffId = staff.Id,
+                CustomerName = $"Ghép bàn từ {oldOrders.Count} orders",
+                CustomerPhone = oldOrders.First().CustomerPhone ?? "0399563215",
+                NumberOfGuests = oldOrders.Sum(o => o.NumberOfGuests),
+                OrderType = "DineIn",
+                OrderTime = DateTime.UtcNow,
+                CreatedAt = DateTime.UtcNow,
+                UpdatedAt = DateTime.UtcNow,
+                Status = "Ordered"
+            };
+
+            _context.Orders.Add(newOrder);
+            await _context.SaveChangesAsync();
+
+            // 2️⃣ Copy tất cả OrderDetails từ các order cũ sang order mới
+            decimal totalSubTotal = 0;
+            foreach (var oldOrder in oldOrders)
+            {
+                var orderDetails = await _context.OrderDetails
+                    .Where(od => od.OrderId == oldOrder.Id)
+                    .ToListAsync();
+
+                foreach (var detail in orderDetails)
+                {
+                    var newDetail = new OrderDetail
+                    {
+                        OrderId = newOrder.Id,
+                        MenuItemId = detail.MenuItemId,
+                        Quantity = detail.Quantity,
+                        UnitPrice = detail.UnitPrice,
+                        Note = detail.Note,
+                        Status = detail.Status,
+                        KitchenCode = $"K-{DateTime.Now:MMddHHmmss}-{detail.MenuItemId}",
+                        CreatedAt = DateTime.UtcNow,
+                        UpdatedAt = DateTime.UtcNow
+                    };
+                    _context.OrderDetails.Add(newDetail);
+                    totalSubTotal += detail.UnitPrice * detail.Quantity;
+                }
+
+                // Cancel order cũ
+                oldOrder.Status = "Cancelled";
+                oldOrder.UpdatedAt = DateTime.UtcNow;
+            }
+
+            // 3️⃣ Link tất cả bàn vào order mới
+            foreach (var tableId in tableIds)
+            {
+                _context.OrderTables.Add(new OrderTable
+                {
+                    OrderId = newOrder.Id,
+                    TableId = tableId
+                });
+
+                var table = tables.First(t => t.Id == tableId);
+                table.Status = "Occupied";
+            }
+
+            // 4 Tính toán totals cho order mới
+            newOrder.SubTotal = totalSubTotal;
+            newOrder.TaxAmount = (newOrder.SubTotal - newOrder.DiscountAmount) * 0.1m;
+            newOrder.TotalAmount = newOrder.SubTotal - newOrder.DiscountAmount + newOrder.TaxAmount;
+
+            await _context.SaveChangesAsync();
+            await transaction.CommitAsync();
+
+            return Ok(new
+            {
+                message = $"Đã tạo Order #{newOrder.OrderNumber} mới từ {oldOrders.Count} orders cũ",
+                newOrder = new
+                {
+                    id = newOrder.Id,
+                    orderNumber = newOrder.OrderNumber,
+                    subTotal = newOrder.SubTotal,
+                    taxAmount = newOrder.TaxAmount,
+                    totalAmount = newOrder.TotalAmount
+                },
+                cancelledOrders = oldOrders.Select(o => new { id = o.Id, orderNumber = o.OrderNumber }),
+                tables = tables.Select(t => new { id = t.Id, number = t.TableNumber })
+            });
+        }
+
+        private string GenerateTableToken(int tableId, int orderId)
+        {
+            try
+            {
+
+                if (string.IsNullOrEmpty(_jwtkey))
+                {
+                    throw new InvalidOperationException("❌ JWT Key is NULL or empty in configuration!");
+                }
+
+
+                var securityKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_jwtkey));
+                var credentials = new SigningCredentials(securityKey, SecurityAlgorithms.HmacSha256);
+
+
+                var claims = new[]
+                {
+                    new Claim("tableId", tableId.ToString()),
+                    new Claim("orderId", orderId.ToString()),
+                    new Claim("type", "table-access"),
+                    new Claim("role", "Customer"),
+                    new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString()),
+                    new Claim(JwtRegisteredClaimNames.Iat,
+                    DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString(),
+                    ClaimValueTypes.Integer64)
+                };
+
+                // ✅ Tạo token
+                var token = new JwtSecurityToken(
+                    issuer: _configuration["Jwt:Issuer"],
+                    audience: _configuration["Jwt:Audience"],
+                    claims: claims,
+                    expires: DateTime.UtcNow.AddHours(4), // 4 giờ
+                    signingCredentials: credentials
+                );
+
+                var tokenString = new JwtSecurityTokenHandler().WriteToken(token);
+                Console.WriteLine($"✅ Token created. Length: {tokenString.Length}");
+
+                return tokenString;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"❌ Error generating token: {ex.Message}");
+                throw;
+            }
+        }
+
+        private TableDTO MapToDto(Table t)
+        {
+            return new TableDTO
+            {
+                Id = t.Id,
+                TableNumber = t.TableNumber,
+                TableName = t.TableName,
+                Capacity = t.Capacity,
+                Location = t.Location,
+                Status = t.Status,
+                IsActive = t.IsActive,
+                CreatedAt = t.CreatedAt,
+                QrCodeUrl = t.QrCodeUrl
+            };
+        }
+    }
+
+    // DTO
+   
+}

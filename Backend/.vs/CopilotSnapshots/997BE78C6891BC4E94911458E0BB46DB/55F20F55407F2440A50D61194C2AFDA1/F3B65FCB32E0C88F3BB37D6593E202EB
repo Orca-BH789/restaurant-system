@@ -1,0 +1,497 @@
+﻿using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Restaurant_Management.Models.DTO.AI.RestaurantManagement.DTOs.AI;
+using Restaurant_Management.Services.AI;
+using System.Security.Claims;
+
+namespace Restaurant_Management.Controllers
+{
+    [Authorize]
+    [ApiController]
+    [Route("api/[controller]")]
+    public class AIChatController : ControllerBase
+    {
+        private readonly IAIChatService _chatService;
+        private readonly IChatBotAuthorizationHelper _authHelper;
+        private readonly IChatBotDataAccessService _chatBotDataService;
+
+        public AIChatController(IAIChatService chatService,IChatBotAuthorizationHelper authHelper,IChatBotDataAccessService chatBotDataService)
+        {
+            _chatService = chatService;
+            _authHelper = authHelper;
+            _chatBotDataService = chatBotDataService;
+        }
+
+        /// <summary>
+        /// Gửi tin nhắn cho AI
+        /// </summary>
+        [HttpPost("message")]
+        public async Task<ActionResult<SendMessageResponse>> SendMessage([FromBody] SendMessageRequest request)
+        {
+            try
+            {
+                var userId = GetCurrentUserId();
+                var response = await _chatService.SendMessageAsync(request, userId);
+                return Ok(response);
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                return Unauthorized(new { message = ex.Message });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        /// <summary>
+        /// Lấy chi tiết conversation
+        /// </summary>
+        [HttpGet("conversation/{sessionId}")]
+        public async Task<ActionResult<ConversationDto>> GetConversation(string sessionId)
+        {
+            try
+            {
+                var conversation = await _chatService.GetConversationAsync(sessionId);
+                if (conversation == null)
+                    return NotFound(new { message = "Conversation not found" });
+
+                return Ok(conversation);
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        /// <summary>
+        /// Lấy lịch sử conversations của user
+        /// </summary>
+        [HttpGet("history")]
+        public async Task<ActionResult<ConversationHistoryResponse>> GetHistory(
+            [FromQuery] int page = 1,
+            [FromQuery] int pageSize = 10)
+        {
+            try
+            {
+                var userId = GetCurrentUserId();
+                var history = await _chatService.GetUserConversationsAsync(userId, page, pageSize);
+                return Ok(history);
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        /// <summary>
+        /// Kết thúc conversation
+        /// </summary>
+        [HttpPost("conversation/{sessionId}/end")]
+        public async Task<ActionResult> EndConversation(string sessionId)
+        {
+            try
+            {
+                var result = await _chatService.EndConversationAsync(sessionId);
+                if (!result)
+                    return NotFound(new { message = "Conversation not found" });
+
+                return Ok(new { message = "Conversation ended successfully" });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        /// <summary>
+        /// Test endpoint - Gợi ý menu
+        /// </summary>
+        [HttpPost("test/menu-suggestions")]
+        public async Task<ActionResult<List<MenuSuggestionDto>>> TestMenuSuggestions(
+            [FromBody] string userMessage)
+        {
+            try
+            {
+                var userId = GetCurrentUserId();
+
+                // Create temp conversation for testing
+                var tempRequest = new SendMessageRequest { Message = userMessage };
+                var response = await _chatService.SendMessageAsync(tempRequest, userId);
+
+                return Ok(response.Data);
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        /// <summary>
+        /// Endpoint dành riêng cho ChatBot Assistant
+        /// Có quyền truy cập toàn diện để phân tích dữ liệu
+        /// Endpoint này chỉ cho ChatBot role
+        /// </summary>
+        [Authorize(Policy = "ChatBotAssistantOnly")]
+        [HttpGet("assistant/status")]
+        public ActionResult<object> GetAssistantStatus()
+        {
+            try
+            {
+                if (!_authHelper.IsChatBotAssistant(User))
+                {
+                    return Forbid();
+                }
+
+                return Ok(new
+                {
+                    message = "ChatBot Assistant is active",
+                    role = _authHelper.GetUserRole(User),
+                    permissions = new
+                    {
+                        canReadAllData = true,
+                        canAccessAnalytics = true,
+                        canGenerateReports = true,
+                        canModifyTransactions = false,
+                        canAccessPersonalData = false
+                    },
+                    timestamp = DateTime.UtcNow
+                });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        /// <summary>
+        /// Gợi ý tối ưu hóa doanh thu dành cho ChatBot
+        /// ChatBot có quyền truy cập toàn bộ analytics
+        /// </summary>
+        [Authorize(Policy = "ChatBotOrManager")]
+        [HttpGet("assistant/analytics/recommendations")]
+        public async Task<ActionResult<object>> GetOptimizationRecommendations(
+            [FromQuery] string? period = "week")
+        {
+            try
+            {
+                if (!_authHelper.CanAccessAnalytics(User))
+                {
+                    return Forbid();
+                }
+
+                var recommendations = new
+                {
+                    timestamp = DateTime.UtcNow,
+                    period = period ?? "week",
+                    recommendations = new[]
+                    {
+                        new
+                        {
+                            type = "revenue_optimization",
+                            title = "Tối ưu hóa doanh thu",
+                            description = "Dựa trên phân tích dữ liệu bán hàng",
+                            priority = "high",
+                            details = "Các đề xuất sẽ được sinh ra từ AI sau khi phân tích",
+                            generatedBy = "ChatBot Assistant"
+                        }
+                    },
+                    accessLevel = "ChatBot Full Analytics Access"
+                };
+
+                return Ok(recommendations);
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        /// <summary>
+        /// Kiểm tra quyền hạn của ChatBot
+        /// </summary>
+        [HttpGet("assistant/permissions")]
+        public ActionResult<object> CheckPermissions()
+        {
+            try
+            {
+                var userId = GetCurrentUserId();
+                var userRole = _authHelper.GetUserRole(User);
+                var isChatBot = _authHelper.IsChatBotAssistant(User);
+
+                return Ok(new
+                {
+                    userId = userId,
+                    userRole = userRole,
+                    isChatBotAssistant = isChatBot,
+                    permissions = new
+                    {
+                        canReadAllData = isChatBot || userRole == "Admin" || userRole == "Manager",
+                        canAccessAnalytics = _authHelper.CanAccessAnalytics(User),
+                        canGenerateReports = _authHelper.CanGenerateReports(User),
+                        canModifyOrders = userRole == "Admin" || userRole == "Staff",
+                        canModifyMenuItems = userRole == "Admin",
+                        canAccessPersonalData = false // Never expose personal data
+                    },
+                    accessDescription = isChatBot 
+                        ? "ChatBot Assistant - Toàn quyền truy cập dữ liệu kinh doanh" 
+                        : userRole == "Admin" 
+                            ? "Administrator - Toàn quyền" 
+                            : "Limited access"
+                });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        /// <summary>
+        /// Dashboard thống kê dành cho ChatBot Assistant
+        /// Chỉ ChatBot có thể truy cập endpoint này
+        /// </summary>
+        [Authorize(Policy = "ChatBotAssistantOnly")]
+        [HttpGet("assistant/dashboard")]
+        public async Task<ActionResult<object>> GetChatBotDashboard()
+        {
+            try
+            {
+                if (!_authHelper.IsChatBotAssistant(User))
+                {
+                    return Forbid();
+                }
+
+                var summary = await _chatBotDataService.GetBusinessSummaryAsync();
+
+                return Ok(new
+                {
+                    status = "success",
+                    data = summary,
+                    accessLevel = "ChatBot Full Analytics Access",
+                    message = "ChatBot có quyền truy cập toàn diện dữ liệu kinh doanh",
+                    generatedAt = DateTime.UtcNow
+                });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        /// <summary>
+        /// Lấy dữ liệu chi tiết cho ChatBot phân tích (toàn diện)
+        /// Chỉ ChatBot hoặc Admin mới có thể truy cập
+        /// </summary>
+        [Authorize(Policy = "AdminOrChatBot")]
+        [HttpGet("assistant/analytics/detailed")]
+        public async Task<ActionResult<object>> GetDetailedAnalytics(
+            [FromQuery] DateTime? fromDate = null,
+            [FromQuery] DateTime? toDate = null,
+            [FromQuery] string? analysisType = "revenue")
+        {
+            try
+            {
+                if (!_authHelper.CanAccessAnalytics(User))
+                {
+                    return Forbid();
+                }
+
+                var isChatBot = _authHelper.IsChatBotAssistant(User);
+                var start = fromDate ?? DateTime.Today.AddMonths(-1);
+                var end = toDate ?? DateTime.Today.AddDays(1);
+
+                object result = analysisType?.ToLower() switch
+                {
+                    "revenue" => await GetRevenueAnalytics(start, end),
+                    "items" => await GetItemsAnalytics(start, end),
+                    "promotions" => await GetPromotionsAnalytics(start, end),
+                    "tables" => await GetTablesAnalytics(),
+                    _ => new { message = "Invalid analysis type" }
+                };
+
+                return Ok(new
+                {
+                    status = "success",
+                    analysisType = analysisType,
+                    period = new { from = start, to = end },
+                    data = result,
+                    accessLevel = isChatBot ? "ChatBot Full Access" : "Admin Access",
+                    generatedAt = DateTime.UtcNow
+                });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+        }
+
+        // Helper methods
+        private int? GetCurrentUserId()
+        {
+            var userIdClaim = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+            return int.TryParse(userIdClaim, out var userId) ? userId : null;
+        }
+
+        /// <summary>
+        /// Phân tích doanh thu
+        /// </summary>
+        private async Task<object> GetRevenueAnalytics(DateTime startDate, DateTime endDate)
+        {
+            try
+            {
+                var orders = await _chatBotDataService.GetAllOrdersForAnalyticsAsync();
+                var filteredOrders = orders
+                    .Where(o => o.OrderTime >= startDate && o.OrderTime <= endDate)
+                    .ToList();
+
+                var dailyRevenue = filteredOrders
+                    .GroupBy(o => o.OrderTime.Date)
+                    .Select(g => new
+                    {
+                        date = g.Key,
+                        revenue = g.Sum(o => o.TotalAmount),
+                        orderCount = g.Count(),
+                        avgOrderValue = g.Average(o => o.TotalAmount)
+                    })
+                    .OrderBy(x => x.date)
+                    .ToList();
+
+                var totalRevenue = filteredOrders.Sum(o => o.TotalAmount);
+                var totalOrders = filteredOrders.Count;
+
+                return new
+                {
+                    totalRevenue = totalRevenue,
+                    totalOrders = totalOrders,
+                    avgOrderValue = totalOrders > 0 ? totalRevenue / totalOrders : 0,
+                    dailyBreakdown = dailyRevenue,
+                    period = new { from = startDate, to = endDate }
+                };
+            }
+            catch (Exception ex)
+            {
+                return new { error = ex.Message };
+            }
+        }
+
+        /// <summary>
+        /// Phân tích menu items bán chạy nhất
+        /// </summary>
+        private async Task<object> GetItemsAnalytics(DateTime startDate, DateTime endDate)
+        {
+            try
+            {
+                var orders = await _chatBotDataService.GetAllOrdersForAnalyticsAsync();
+                var filteredOrders = orders
+                    .Where(o => o.OrderTime >= startDate && o.OrderTime <= endDate)
+                    .ToList();
+
+                var topItems = filteredOrders
+                    .SelectMany(o => o.OrderDetails ?? new List<Models.Entities.OrderDetail>())
+                    .GroupBy(od => new { od.MenuItemId, od.MenuItem!.Name })
+                    .Select(g => new
+                    {
+                        menuItemId = g.Key.MenuItemId,
+                        itemName = g.Key.Name,
+                        totalQuantity = g.Sum(od => od.Quantity),
+                        totalRevenue = g.Sum(od => od.Quantity * od.UnitPrice),
+                        avgUnitPrice = g.Average(od => od.UnitPrice),
+                        orderCount = g.Select(od => od.OrderId).Distinct().Count()
+                    })
+                    .OrderByDescending(x => x.totalQuantity)
+                    .Take(20)
+                    .ToList();
+
+                return new
+                {
+                    topSellingItems = topItems,
+                    totalItemsSold = filteredOrders.SelectMany(o => o.OrderDetails ?? new List<Models.Entities.OrderDetail>()).Sum(od => od.Quantity),
+                    uniqueItemsOrdered = filteredOrders.SelectMany(o => o.OrderDetails ?? new List<Models.Entities.OrderDetail>()).Select(od => od.MenuItemId).Distinct().Count(),
+                    period = new { from = startDate, to = endDate }
+                };
+            }
+            catch (Exception ex)
+            {
+                return new { error = ex.Message };
+            }
+        }
+
+        /// <summary>
+        /// Phân tích hiệu quả khuyến mãi
+        /// </summary>
+        private async Task<object> GetPromotionsAnalytics(DateTime startDate, DateTime endDate)
+        {
+            try
+            {
+                var promotions = _chatBotDataService.GetAllPromotions().ToList();
+
+                var promotionStats = promotions
+                    .Select(p => new
+                    {
+                        promotionId = p.Id,
+                        code = p.Code,
+                        name = p.Name,
+                        discountType = p.DiscountPercent.HasValue ? "Percentage" : "Fixed Amount",
+                        discountValue = p.DiscountPercent ?? p.DiscountAmount ?? 0,
+                        active = p.Active,
+                        usageCount = p.PromotionUsages?.Count ?? 0,
+                        effectiveFrom = p.StartDate,
+                        effectiveTo = p.EndDate
+                    })
+                    .ToList();
+
+                return new
+                {
+                    totalPromotions = promotions.Count,
+                    activePromotions = promotions.Count(p => p.Active),
+                    promotionDetails = promotionStats,
+                    period = new { from = startDate, to = endDate }
+                };
+            }
+            catch (Exception ex)
+            {
+                return new { error = ex.Message };
+            }
+        }
+
+        /// <summary>
+        /// Phân tích trạng thái bàn
+        /// </summary>
+        private async Task<object> GetTablesAnalytics()
+        {
+            try
+            {
+                var tables = _chatBotDataService.GetAllTables().ToList();
+
+                var tableStatus = tables
+                    .GroupBy(t => t.Status)
+                    .Select(g => new
+                    {
+                        status = g.Key,
+                        count = g.Count(),
+                        percentage = (g.Count() * 100.0) / tables.Count
+                    })
+                    .ToList();
+
+                var capacity = new
+                {
+                    totalCapacity = tables.Sum(t => t.Capacity),
+                    avgCapacity = tables.Average(t => t.Capacity),
+                    maxCapacity = tables.Max(t => t.Capacity),
+                    minCapacity = tables.Min(t => t.Capacity)
+                };
+
+                return new
+                {
+                    totalTables = tables.Count,
+                    statusBreakdown = tableStatus,
+                    capacityStats = capacity
+                };
+            }
+            catch (Exception ex)
+            {
+                return new { error = ex.Message };
+            }
+        }
+    }
+}
